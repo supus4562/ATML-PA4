@@ -1,1 +1,21 @@
 *.pdf
+extracted_pdf_text.txt
+research_papers/
+
+# Python & environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Modal & cloud logs
+runs/modal_logs/
+.modal_cache/
+
+# Large model artifacts & checkpoints
+*.pt
+*.bin
+*.safetensors
+*.gz
+checkpoints/
+data/public_locked/
