@@ -90,51 +90,54 @@ This document serves as the single source of truth and comprehensive checklist f
 ## 3. Task 2: Efficient Attention & Context Memory
 
 ### Part A: Attention Operators
-- [ ] **Implement 3 Operators:**
+- [x] **Implement 3 Operators:**
   1. Dense causal attention ($QK^\top / \sqrt{d}$, causal mask, stable softmax, multiply $V$).
   2. Tiled online-softmax causal attention (blockwise forward pass without full $L \times L$ matrix).
   3. PyTorch `torch.nn.functional.scaled_dot_product_attention` (SDPA).
-- [ ] **Test Grid:** Synthetic inputs with $B = 2, H = 4, d_h = 64$; lengths $L \in \{256, 512, 1024, 2048, 4096, 8192\}$; FP16 and FP32.
-- [ ] **Causality Verification:** Perturb future keys/values and verify past outputs remain strictly invariant.
-- [ ] **Evidence:** Output error ($\max |y - y_{\text{ref}}|$) and gradient error ($\max |g - g_{\text{ref}}|$) vs. FP32 dense reference; forward latency vs. full forward+backward latency; peak VRAM; recorded SDPA backend.
-- [ ] ❌ **DO NOT** claim Python-tiled autograd represents a fused FlashAttention kernel.
+- [x] **Test Grid:** Synthetic inputs with $B = 2, H = 4, d_h = 64$; lengths $L \in \{256, 512, 1024, 2048, 4096, 8192\}$; FP16 and FP32.
+- [x] **Causality Verification:** Perturb future keys/values and verify past outputs remain strictly invariant (max difference $0.0$).
+- [x] **Evidence:** Output error ($\le 2.98 \times 10^{-6}$ vs. FP32 reference) and gradient error ($\le 3.58 \times 10^{-7}$); forward latency vs. full forward+backward latency; peak VRAM ($138\text{ MB}$ at $L=8192$ vs. dense autograd OOM); recorded SDPA backend (`flash` on supported sizes).
+- [x] ❌ **DO NOT** claim Python-tiled autograd represents a fused FlashAttention kernel.
 
 ### Part B: Associative Recall (MQAR)
-- [ ] **Model Architecture (from scratch):**
+- [x] **Model Architecture (from scratch):**
   - 2 decoder blocks, hidden dimension 128, 4 heads ($d_h = 32$), MLP $4\times$, vocab 256.
   - Learned token embeddings, sinusoidal positional embeddings.
-- [ ] **Training Protocol:**
+- [x] **Training Protocol:**
   - Optimizer: AdamW (peak LR $8 \times 10^{-4}$, weight decay 0.01).
   - Schedule: 32 sequences/batch, 4,500 updates, 200 warmup, linear decay to 15%, grad norm clip 1.0.
   - Multi-seed requirement: Run seeds **`6304`**, **`6305`**, **`6306`** for all required models.
-- [ ] **Data Generator:** MQAR at $T = 256, K \in \{4, 8, 16\}$.
+- [x] **Data Generator:** MQAR at $T = 256, K \in \{4, 8, 16\}$.
   - Regimes: Near (distance $< 64$), Far (distance in $[128, 250]$), Mixed (all feasible distances).
-- [ ] **Models Trained:**
-  - Dense attention: Mixed regime at $K \in \{4, 8, 16\}$ + Near-only at $K = 16$.
-  - Sliding Window ($W = 64$): Near-only at $K \in \{4, 8, 16\}$ + Mixed at $K = 16$.
-  - Linear Attention (causal ELU+1): Mixed regime at $K \in \{4, 8, 16\}$.
+- [x] **Models Trained:**
+  - Dense attention: Mixed regime at $K \in \{4, 8, 16\}$ + Near-only at $K = 16$ ($>99.9\%$ recall).
+  - Sliding Window ($W = 64$): Near-only at $K \in \{4, 8, 16\}$ + Mixed at $K = 16$ (Near: $100.0\%$, Far: $1.46\%$ matching $1/64 = 1.56\%$ random chance).
+  - Linear Attention (causal ELU+1): Mixed regime at $K \in \{4, 8, 16\}$ ($>98\%$ recall, $O(T)$ runtime).
   - Mixed Local/Dilated Sparse: Mixed regime at $K \in \{4, 16\}$ (2 heads attend to preceding 64; 2 heads attend to offsets $\{0, 4, 8, \dots, 252\}$).
-  - Test-time mask control: Apply $W = 64$ mask at test-time to learned dense model.
-  - Controlled Intervention: One motivated architectural/training modification at $K = 16$ across all 3 seeds (within 5% baseline parameters).
-- [ ] **Forward-Only Sequence Sweep:** Fixed random inputs at $T \in \{256, 1024, 4096, 8192\}$.
-- [ ] **Evidence:** Learning curves; test accuracy on 1,024 test sequences across distance bins $[0, 32), [32, 64), [64, 128), [128, 256)$; comparison against label chance ($1/64$) and in-context chance ($1/K$).
-- [ ] ❌ **DO NOT** use next-token loss (MQAR is supervised query-position classification).
-- [ ] ❌ **DO NOT** use a single fixed offset of 128 for far queries (must span $[128, 250]$).
+  - Test-time mask control: Apply $W = 64$ mask at test-time to learned dense model (drops accuracy on far queries).
+  - Controlled Intervention: Decay-Gated Linear Attention (DGLA) at $K = 16$ across all 3 seeds (within 5% baseline parameters; parallel cumsum formulation with $23\text{ ms/step}$ speed).
+- [x] **Forward-Only Sequence Sweep:** Fixed random inputs at $T \in \{256, 1024, 4096, 8192\}$ (Dense: $0.71 \to 18.49\text{ ms}$, Window: $1.17 \to 112.67\text{ ms}$, Linear: $1.21 \to 20.20\text{ ms}$, Dilated: $1.31 \to 129.55\text{ ms}$, DGLA: $1.59 \to 179.15\text{ ms}$).
+- [x] **Evidence:** Learning curves; test accuracy on 1,024 test sequences across distance bins $[0, 32), [32, 64), [64, 128), [128, 256)$; comparison against label chance ($1/64$) and in-context chance ($1/K$).
+- [x] ❌ **DO NOT** use next-token loss (MQAR is supervised query-position classification).
+- [x] ❌ **DO NOT** use a single fixed offset of 128 for far queries (must span $[128, 250]$).
 
 ### Part C: Pretrained KV Memory Compression
-- [ ] **Model:** Pretrained `Qwen/Qwen2.5-1.5B-Instruct` in FP16, greedy decoding.
-- [ ] **Data:** 180 frozen long-context retrieval prompts (`kv_retrieval_cases.jsonl.gz`) across 2,048 & 4,096 tokens, gold evidence at start/middle/end, 0/2/8 distractors.
-- [ ] **Case-Specific Matched Budget:** Exact serialized byte size of **INT4 channel-wise-K / token-wise-V cache** with group size 64:
+- [x] **Model:** Pretrained `Qwen/Qwen2.5-1.5B-Instruct` in FP16, greedy decoding.
+- [x] **Data:** 180 frozen long-context retrieval prompts (`kv_retrieval_cases.jsonl.gz`) across 2,048 & 4,096 tokens, gold evidence at start/middle/end, 0/2/8 distractors.
+- [x] **Case-Specific Matched Budget:** Exact serialized byte size of **INT4 channel-wise-K / token-wise-V cache** with group size 64:
   $$M_b(L) = 2 n_\ell H_{\text{kv}} d_h \left[ \left\lfloor \frac{L}{64} \right\rfloor \left( \frac{64 \cdot b}{8} + 4 \right) + 2(L \bmod 64) \right]$$
-- [ ] **5 Policies Evaluated Under Identical Budget:**
-  1. **Sink + Recent FP16 Eviction:** 8 sink tokens + 64 recent tokens + fill budget with most recent positions.
-  2. **Question-Aware FP16 Eviction:** 8 sink tokens + 64 recent tokens + rank remaining positions using question-suffix attention.
-  3. **Token-wise INT4:** Both K and V grouped along hidden dimension per token (group 64).
-  4. **Channel-wise K / Token-wise V INT4:** K grouped along tokens per channel; V grouped along channels per token (group 64).
-  5. **Hybrid Precision & Selection:** 8 sink + 64 recent in FP16 + top question-aware positions in FP16 + compress remaining positions in INT2 channel-K/token-V.
-- [ ] **Evidence:** Full-precision split-prefill/decode equivalence sanity check; matched-budget table (exact-match accuracy, answer NLL, logit KL from FP16, retained evidence fraction, packed bytes, peak VRAM); paired bootstrap intervals ($\ge 2,000$ resamples); independent encode/decode benchmarks at batch 1 and 8 (lengths 2k and 4k).
-- [ ] ❌ **DO NOT** give gold evidence character coordinates to retention algorithms.
-- [ ] ❌ **DO NOT** lose original absolute rotary position IDs (RoPE) when evicting tokens.
+- [x] **5 Policies Evaluated Under Identical Budget:**
+  1. **Sink + Recent FP16 Eviction:** 8 sink tokens + 64 recent tokens + fill budget with most recent positions (Acc: $33.3\%$, NLL: $2.11$, KL: $2.10$, MB: $30.7$).
+  2. **Question-Aware FP16 Eviction:** 8 sink tokens + 64 recent tokens + rank remaining positions using question-suffix attention (Acc: $10.6\%$, NLL: $1.46$, KL: $1.44$, MB: $30.7$).
+  3. **Token-wise INT4:** Both K and V grouped along hidden dimension per token, group 64 (Acc: $87.8\%$, NLL: $0.39$, KL: $0.37$, MB: $30.2$).
+  4. **Channel-wise K / Token-wise V INT4:** K grouped along tokens per channel; V grouped along channels per token, group 64 (Acc: $0.0\%$, NLL: $5.05$, KL: $5.02$, MB: $30.4$).
+  5. **Hybrid Precision & Selection:** 8 sink + 64 recent in FP16 + top question-aware positions in FP16 + compress remaining positions in INT2 channel-K/token-V (Acc: $0.0\%$, NLL: $5.46$, KL: $5.42$, MB: $30.5$).
+- [x] **Evidence:** Full-precision split-prefill/decode equivalence sanity check ($100.0\%$ match); matched-budget table (exact-match accuracy, answer NLL, logit KL from FP16, retained evidence fraction, packed bytes, peak VRAM); paired bootstrap intervals ($B=2,000$ resamples: Token-wise INT4 vs SnapKV $\Delta\text{Acc} = +77.2\%$, $95\%\text{ CI } [+70.0\%, +84.4\%]$); independent encode/decode benchmarks at batch 1 and 8 (lengths 2k and 4k).
+- [x] **Extension: Context Memory Benchmarking (OOLONG & M-NIAH):**
+  - **Option A (OOLONG `synth-with-labels`):** Baseline FP16 score gate evaluated at $10.0\%$; halted due to empirical floor effect ($<20\%$).
+  - **Option B (Multi-Needle in a Haystack, M-NIAH):** FP16 Reference: $75.0\%$, SnapKV: $39.6\%$, Token-wise INT4: $18.1\%$, Sink+Recent: $13.9\%$, Channel-K INT4: $12.5\%$, Hybrid INT2: $8.3\%$.
+- [x] ❌ **DO NOT** give gold evidence character coordinates to retention algorithms.
+- [x] ❌ **DO NOT** lose original absolute rotary position IDs (RoPE) when evicting tokens.
 
 ---
 
