@@ -108,6 +108,7 @@ def _run_task2_in_container(
     part_c: bool = False,
     run_all: bool = False,
     context_only: bool = False,
+    debug: bool = False,
 ) -> dict:
     """Execute Task 2 inside cloud container with GPU acceleration and volume checkpointing."""
     import sys
@@ -126,6 +127,11 @@ def _run_task2_in_container(
     print(f"Device: {gpu_name} ({total_mem:.1f} GB VRAM)")
     print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
     print("=" * 80, flush=True)
+
+    if debug:
+        from task2.scratch_debug import run_debug
+        run_debug()
+        return {"debug": True}
 
     ckpt_dir = Path("/root/volume/checkpoints/task2")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -147,11 +153,11 @@ def _run_task2_in_container(
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from task2.config import KV_MODEL_NAME
         from task2.eval_context_benchmark import run_context_benchmarks
-        print(f"Loading '{KV_MODEL_NAME}' in FP16 on cuda...")
+        print(f"Loading '{KV_MODEL_NAME}' in bfloat16 on cuda...")
         tokenizer = AutoTokenizer.from_pretrained(KV_MODEL_NAME, use_fast=True)
         model = AutoModelForCausalLM.from_pretrained(
             KV_MODEL_NAME,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             attn_implementation="eager",
             device_map="cuda",
         )
@@ -188,8 +194,8 @@ if app is not None:
         volumes=VOLUME_MOUNTS,
         timeout=3600 * 2,  # 2 hours max
     )
-    def run_task2_l4(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False):
-        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only)
+    def run_task2_l4(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False):
+        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug)
 
     @app.function(
         image=image,
@@ -197,8 +203,8 @@ if app is not None:
         volumes=VOLUME_MOUNTS,
         timeout=3600 * 2,
     )
-    def run_task2_a10g(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False):
-        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only)
+    def run_task2_a10g(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False):
+        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug)
 
     @app.function(
         image=image,
@@ -206,8 +212,8 @@ if app is not None:
         volumes=VOLUME_MOUNTS,
         timeout=3600 * 2,
     )
-    def run_task2_a100(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False):
-        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only)
+    def run_task2_a100(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False):
+        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug)
 
     @app.function(
         image=image,
@@ -246,6 +252,7 @@ def main(
     run_all: bool = False,
     context_only: bool = False,
     dry_run: bool = False,
+    debug: bool = False,
     action: str = "",
 ):
     print("=" * 80)
@@ -258,7 +265,8 @@ def main(
     print(f"Part B:        {part_b or run_all}")
     print(f"Part C:        {part_c or run_all}")
     print(f"Context Only:  {context_only}")
-    print(f"Run All:       {run_all or not (part_a or part_b or part_c or context_only)}")
+    print(f"Debug:         {debug}")
+    print(f"Run All:       {run_all or not (part_a or part_b or part_c or context_only or debug)}")
     print("=" * 80)
 
     if dry_run:
@@ -301,6 +309,7 @@ def main(
         part_c=part_c,
         run_all=run_all,
         context_only=context_only,
+        debug=debug,
     )
     print("\n[Modal Cloud] Execution finished successfully.")
 

@@ -84,7 +84,9 @@ def evaluate_kv_prompt_case(
     prompt_record: Dict,
     policy_name: str,
     device: str = "cuda",
-) -> Dict[str, Any]:
+    precomputed_cache: Optional[Tuple[List[torch.Tensor], List[torch.Tensor], Any]] = None,
+    return_precomputed: bool = False,
+) -> Any:
     """Evaluate a single long-context prompt under a specific cache policy with RoPE-preserved greedy decode."""
     user_text = prompt_record.get("user_text", prompt_record.get("prompt", ""))
     gold_code = str(prompt_record.get("code", prompt_record.get("target_code", "")))
@@ -112,22 +114,20 @@ def evaluate_kv_prompt_case(
     L_ctx = enc_context.input_ids.shape[1]
     L_q = enc_question.input_ids.shape[1]
 
-    # 1. Prefill context through model to extract initial past_key_values
-    with torch.no_grad():
-        out_ctx = model(**enc_context, use_cache=True)
-        pkv = out_ctx.past_key_values
+    # 1. Prefill context or reuse cached past_key_values
+    if precomputed_cache is not None:
+        k_list = [k.clone() for k in precomputed_cache[0]]
+        v_list = [v.clone() for v in precomputed_cache[1]]
+        q_importance = precomputed_cache[2]
+    else:
+        with torch.no_grad():
+            out_ctx = model(**enc_context, use_cache=True)
+            pkv = out_ctx.past_key_values
 
-    # In modern transformers, DynamicCache is used: unpack layers into k_list and v_list
-    k_list = []
-    v_list = []
-    for layer_idx in range(len(pkv)):
-        # DynamicCache can be indexed by layer_idx
-        k_list.append(pkv[layer_idx][0].clone())
-        v_list.append(pkv[layer_idx][1].clone())
+        k_list = [pkv[i][0].clone() for i in range(len(pkv))]
+        v_list = [pkv[i][1].clone() for i in range(len(pkv))]
 
-    # Get question-aware attention importance for question-aware policies (SnapKV)
-    q_importance = None
-    if policy_name in ["question_aware_fp16", "hybrid_fp16_int2"]:
+        # Probe attention for SnapKV once per prompt
         from transformers.cache_utils import DynamicCache
         temp_cache = DynamicCache()
         for layer_idx in range(len(k_list)):
@@ -145,11 +145,9 @@ def evaluate_kv_prompt_case(
             if out_probe.attentions is not None:
                 num_layers = len(out_probe.attentions)
                 attn_acc = torch.zeros(L_ctx, device=device, dtype=torch.float32)
-                # SnapKV: aggregate attention weights from the question tokens in deeper layers
                 start_l = num_layers // 2
                 for l_idx in range(start_l, num_layers):
-                    # out_probe.attentions[l_idx]: (1, num_heads, L_q, L_ctx + L_q)
-                    ctx_attn = out_probe.attentions[l_idx][0, :, :, :L_ctx]  # (num_heads, L_q, L_ctx)
+                    ctx_attn = out_probe.attentions[l_idx][0, :, :, :L_ctx]
                     attn_acc += ctx_attn.mean(dim=(0, 1)).float()
                 q_importance = attn_acc
             else:
@@ -214,14 +212,14 @@ def evaluate_kv_prompt_case(
         )
         first_token_logits = out_q.logits[:, -1, :].clone()
 
-    # 4. Autoregressive greedy decode for 16 tokens to extract 5-digit code
+    # 4. Autoregressive greedy decode for up to 48 tokens to extract 5-digit code
     curr_input = torch.argmax(first_token_logits, dim=-1, keepdim=True)
     generated_tokens = [curr_input.item()]
     curr_cache = out_q.past_key_values
     curr_pos = L_ctx + L_q
 
     with torch.no_grad():
-        for _ in range(15):
+        for _ in range(47):
             out_gen = model(
                 input_ids=curr_input,
                 position_ids=torch.tensor([[curr_pos]], device=device),
@@ -229,7 +227,10 @@ def evaluate_kv_prompt_case(
                 use_cache=True,
             )
             curr_input = torch.argmax(out_gen.logits[:, -1, :], dim=-1, keepdim=True)
-            generated_tokens.append(curr_input.item())
+            tok_id = curr_input.item()
+            generated_tokens.append(tok_id)
+            if tok_id in [tokenizer.eos_token_id, 151643, 151645]:
+                break
             curr_cache = out_gen.past_key_values
             curr_pos += 1
 
@@ -245,7 +246,7 @@ def evaluate_kv_prompt_case(
         log_probs = F.log_softmax(first_token_logits, dim=-1)
         answer_nll = -log_probs[0, gold_ids[0]].item()
 
-    return {
+    ret_dict = {
         "prompt_id": prompt_record.get("id", "case"),
         "policy": policy_name,
         "is_correct": is_correct,
@@ -259,6 +260,9 @@ def evaluate_kv_prompt_case(
         "evidence_position": prompt_record.get("position", "middle"),
         "distractors": prompt_record.get("distractors", 0),
     }
+    if return_precomputed:
+        return ret_dict, (k_list, v_list, q_importance)
+    return ret_dict
 
 
 def run_full_kv_evaluation(
@@ -291,15 +295,19 @@ def run_full_kv_evaluation(
         if (idx + 1) % 10 == 0 or idx == 0:
             print(f"Evaluating prompt {idx + 1:3d}/{len(prompts)} [Len: {prompt.get('target_tokens', 2048)} | Pos: {prompt.get('position', 'middle')} | Distr: {prompt.get('distractors', 0)}]")
 
-        # Evaluate reference first to collect FP16 logits for KL divergence
-        ref_res = evaluate_kv_prompt_case(model, tokenizer, prompt, "fp16_reference", device=device)
+        # Evaluate reference first to collect FP16 logits and cache prefilled context
+        ref_res, precomputed = evaluate_kv_prompt_case(
+            model, tokenizer, prompt, "fp16_reference", device=device, return_precomputed=True
+        )
         policy_results["fp16_reference"].append(ref_res)
         ref_logits = ref_res["first_logits"].float()
         ref_probs = F.softmax(ref_logits, dim=-1)
 
-        # Evaluate compressed policies
+        # Evaluate compressed policies reusing the prefilled context
         for p in policies[1:]:
-            res = evaluate_kv_prompt_case(model, tokenizer, prompt, p, device=device)
+            res = evaluate_kv_prompt_case(
+                model, tokenizer, prompt, p, device=device, precomputed_cache=precomputed
+            )
             # Compute logit KL divergence from FP16 reference
             comp_logits = res["first_logits"].float()
             comp_log_probs = F.log_softmax(comp_logits, dim=-1)

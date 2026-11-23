@@ -16,7 +16,7 @@
       "mean_accuracy": 0.0
     },
     "hybrid_fp16_int2": {
-      "mean_accuracy": 0.0
+      "mean_accuracy": 0.16666666666666666
     }
   },
   "multi_needle_mniah": {
@@ -33,15 +33,15 @@
       "mean_needle_recall": 0.1875
     },
     "channel_k_token_v_int4": {
-      "mean_needle_recall": 0.0
+      "mean_needle_recall": 0.020833333333333332
     },
     "hybrid_fp16_int2": {
-      "mean_needle_recall": 0.0
+      "mean_needle_recall": 0.10416666666666667
     }
   },
   "variable_tracking": {
     "fp16_reference": {
-      "mean_accuracy": 0.0
+      "mean_accuracy": 0.25
     },
     "sink_recent_fp16": {
       "mean_accuracy": 0.0

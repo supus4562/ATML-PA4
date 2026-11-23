@@ -274,7 +274,7 @@ def apply_policy_hybrid(
         if len(int2_indices) > 0:
             k_int2 = k[:, :, int2_indices, :]
             v_int2 = v[:, :, int2_indices, :]
-            k_deq, v_deq, layer_int2_bytes = quantize_channel_k_token_v(k_int2, v_int2, bits=2, group_size=KV_GROUP_SIZE)
+            k_deq, v_deq, layer_int2_bytes = quantize_token_wise_kv(k_int2, v_int2, bits=2, group_size=KV_GROUP_SIZE)
             k_new[:, :, int2_indices, :] = k_deq
             v_new[:, :, int2_indices, :] = v_deq
             total_bytes += layer_int2_bytes

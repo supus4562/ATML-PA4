@@ -116,9 +116,9 @@ def quantize_channel_k_token_v(
     bits: int = 4,
     group_size: int = KV_GROUP_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Policy 4: Channel-wise-K (group 64 along tokens, symmetric) and Token-wise-V (group 64 along hidden channels)."""
-    # K shape: (B, H, L, d_h). Grouping along dim 2 (token sequence length L) with symmetric quantization
-    k_deq, _, _, k_bytes = quantize_affine_group(k, bits=bits, group_size=group_size, dim=2, symmetric=True)
+    """Policy 4: Channel-wise-K (group 64 along tokens, asymmetric) and Token-wise-V (group 64 along hidden channels)."""
+    # K shape: (B, H, L, d_h). Grouping along dim 2 (token sequence length L) with asymmetric min-max quantization
+    k_deq, _, _, k_bytes = quantize_affine_group(k, bits=bits, group_size=group_size, dim=2, symmetric=False)
     # V shape: (B, H, L, d_h). Grouping along dim 3 (hidden dim d_h)
     v_deq, _, _, v_bytes = quantize_affine_group(v, bits=bits, group_size=group_size, dim=-1, symmetric=False)
     return k_deq, v_deq, k_bytes + v_bytes

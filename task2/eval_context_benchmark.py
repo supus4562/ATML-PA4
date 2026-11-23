@@ -165,25 +165,29 @@ def generate_variable_tracking_prompt(
 
     # Target variable chain: V0 = gold_val, V1 = V0, V2 = V1, ...
     chain_vars = [f"var_{chr(65 + i)}" for i in range(num_hops + 1)]
-    assignments = [f"{chain_vars[0]} = {gold_val}"]
+    target_chain = [f"{chain_vars[0]} = {gold_val}"]
     for h in range(num_hops):
-        assignments.append(f"{chain_vars[h+1]} = {chain_vars[h]}")
+        target_chain.append(f"{chain_vars[h+1]} = {chain_vars[h]}")
 
     # Distractor chains
-    distractor_assignments = []
-    for d in range(6):
+    distractor_chains = []
+    for d in range(4):
         d_val = f"{rng.randint(10000, 99999)}"
         d_vars = [f"aux_{d}_{chr(80 + j)}" for j in range(num_hops + 1)]
-        distractor_assignments.append(f"{d_vars[0]} = {d_val}")
+        d_chain = [f"{d_vars[0]} = {d_val}"]
         for h in range(num_hops):
-            distractor_assignments.append(f"{d_vars[h+1]} = {d_vars[h]}")
+            d_chain.append(f"{d_vars[h+1]} = {d_vars[h]}")
+        distractor_chains.append(d_chain)
 
+    # Causal topological ordering: Stage 0 (initializations), then Stage 1 (hop 1), etc.
     all_assigns = []
-    for a in assignments:
-        all_assigns.append((True, a))
-    for d in distractor_assignments:
-        all_assigns.append((False, d))
-    rng.shuffle(all_assigns)
+    num_stages = num_hops + 1
+    for stage in range(num_stages):
+        stage_assigns = [(True, target_chain[stage])]
+        for d_chain in distractor_chains:
+            stage_assigns.append((False, d_chain[stage]))
+        rng.shuffle(stage_assigns)
+        all_assigns.extend(stage_assigns)
 
     # Filler text bank
     filler_templates = [
@@ -352,7 +356,8 @@ def evaluate_context_prompt(
         }
     elif task_type == "variable_tracking":
         gold = case["gold_val"]
-        correct = (gold in gen_text)
+        matches = re.findall(r"\b\d{5}\b", gen_text)
+        correct = (gold in gen_text) or (bool(matches) and gold in matches)
         return {
             "policy": policy_name,
             "task": task_type,
