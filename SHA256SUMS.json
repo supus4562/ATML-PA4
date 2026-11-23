@@ -11,7 +11,6 @@
   "data/short_form/short_train.jsonl": "50eb7a8240bb1e8bd17eef6e4758d4309a0369d330608ef419df14cd8eda67e5",
   "docs/DATA_FORMATS.md": "f2313068c152ad494ad828ad3009c3dc747a2b27b8ff42fd4a8152337f48560e",
   "docs/REPRODUCIBILITY.md": "6e0d9818d3483c0474c560ff0bac17c3147c288a6f7d6ada676f1c7059d6bf94",
-  "scripts/check_release_STAFF_LEGACY.py": "8cc0717ffad4daeab00088eb73236269a59a6c666f8775febf9d02f92030b9b0",
   "scripts/check_setup.py": "c3ccaa8f9df104745c6174939adb41affd0ef2f11989caa4cd2f45b20b8ac6a5",
   "scripts/data_io.py": "3112cf1c9d80cd40d77d4402c573735e7ebdd9d31a2d59209a5aad37d61b176d",
   "scripts/generate_checksums.py": "8335c811d82b4dea92348dca5f24f17d0e183bf92f5b087a8be938edc82f5365",
