@@ -125,15 +125,35 @@ def evaluate_kv_prompt_case(
         k_list.append(pkv[layer_idx][0].clone())
         v_list.append(pkv[layer_idx][1].clone())
 
-    # Get query projection of question for question-aware policies
-    # Pass question through first layer or embedding to get query states
-    with torch.no_grad():
-        emb = model.model.embed_tokens(enc_question.input_ids)
-        # Approximate question queries using first self-attention q_proj
-        q_question = model.model.layers[0].self_attn.q_proj(emb)  # (1, L_q, H_q * d_h)
-        H_q = model.config.num_attention_heads
-        d_h = model.config.hidden_size // H_q
-        q_question = q_question.view(1, L_q, H_q, d_h).transpose(1, 2)  # (1, H_q, L_q, d_h)
+    # Get question-aware attention importance for question-aware policies (SnapKV)
+    q_importance = None
+    if policy_name in ["question_aware_fp16", "hybrid_fp16_int2"]:
+        from transformers.cache_utils import DynamicCache
+        temp_cache = DynamicCache()
+        for layer_idx in range(len(k_list)):
+            temp_cache.update(k_list[layer_idx].clone(), v_list[layer_idx].clone(), layer_idx)
+
+        q_pos = torch.arange(L_ctx, L_ctx + L_q, device=device).unsqueeze(0)
+        with torch.no_grad():
+            out_probe = model(
+                input_ids=enc_question.input_ids,
+                position_ids=q_pos,
+                past_key_values=temp_cache,
+                output_attentions=True,
+                use_cache=False,
+            )
+            if out_probe.attentions is not None:
+                num_layers = len(out_probe.attentions)
+                attn_acc = torch.zeros(L_ctx, device=device, dtype=torch.float32)
+                # SnapKV: aggregate attention weights from the question tokens in deeper layers
+                start_l = num_layers // 2
+                for l_idx in range(start_l, num_layers):
+                    # out_probe.attentions[l_idx]: (1, num_heads, L_q, L_ctx + L_q)
+                    ctx_attn = out_probe.attentions[l_idx][0, :, :, :L_ctx]  # (num_heads, L_q, L_ctx)
+                    attn_acc += ctx_attn.mean(dim=(0, 1)).float()
+                q_importance = attn_acc
+            else:
+                q_importance = torch.ones(L_ctx, device=device)
 
     # 2. Apply chosen compression/eviction policy to context cache
     if policy_name == "fp16_reference":
@@ -144,35 +164,36 @@ def evaluate_kv_prompt_case(
     elif policy_name == "sink_recent_fp16":
         k_comp, v_comp, keep_indices, actual_bytes = apply_policy_sink_recent(k_list, v_list)
     elif policy_name == "question_aware_fp16":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_question_aware(k_list, v_list, q_question)
+        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_question_aware(k_list, v_list, q_importance)
     elif policy_name == "token_wise_int4":
         k_comp, v_comp, keep_indices, actual_bytes = apply_policy_token_wise_int4(k_list, v_list)
     elif policy_name == "channel_k_token_v_int4":
         k_comp, v_comp, keep_indices, actual_bytes = apply_policy_channel_k_token_v_int4(k_list, v_list)
     elif policy_name == "hybrid_fp16_int2":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_hybrid(k_list, v_list, q_question)
+        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_hybrid(k_list, v_list, q_importance)
     else:
         raise ValueError(f"Unknown policy: {policy_name}")
 
-    # Calculate evidence retention fraction
-    # Calculate evidence retention fraction
+    # Calculate evidence retention fraction via exact character substring matching
+    retained_fraction = 1.0
     if evidence_text:
-        ev_ids = tokenizer(evidence_text, add_special_tokens=False)["input_ids"]
-        ctx_ids = enc_context.input_ids[0].tolist()
-        ev_len = len(ev_ids)
-        ev_start = -1
-        for i in range(len(ctx_ids) - ev_len + 1):
-            if ctx_ids[i : i + ev_len] == ev_ids:
-                ev_start = i
-                break
-        if ev_start != -1:
-            gold_positions = set(range(ev_start, ev_start + ev_len))
-            retained_positions = set(keep_indices.cpu().numpy().tolist())
-            retained_fraction = len(gold_positions.intersection(retained_positions)) / float(len(gold_positions))
+        char_start = ctx_part.find(evidence_text)
+        if char_start != -1:
+            char_end = char_start + len(evidence_text)
+            enc_offsets = tokenizer(ctx_part, return_offsets_mapping=True, add_special_tokens=False)
+            offsets = enc_offsets["offset_mapping"]
+            gold_token_indices = [
+                i for i, (s, e) in enumerate(offsets)
+                if max(s, char_start) < min(e, char_end)
+            ]
+            if gold_token_indices:
+                gold_positions = set(gold_token_indices)
+                retained_positions = set(keep_indices.cpu().numpy().tolist())
+                retained_fraction = len(gold_positions.intersection(retained_positions)) / float(len(gold_positions))
+            else:
+                retained_fraction = 0.0
         else:
-            retained_fraction = 1.0
-    else:
-        retained_fraction = 1.0
+            retained_fraction = 0.0
 
     # 3. Prefill question suffix on top of compressed cache
     from transformers.cache_utils import DynamicCache

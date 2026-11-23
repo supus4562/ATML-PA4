@@ -221,32 +221,47 @@ def plot_kv_results(part_c_data: dict):
 
 
 def plot_context_benchmark_results(ctx_path: Path):
-    """Plot Option B Multi-Needle Recall comparison across policies."""
+    """Plot Single-Needle (NIAH K=1) and Multi-Needle (M-NIAH) Recall across policies."""
     if not ctx_path.exists():
         return
     with open(ctx_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    mniah = data.get("option_b_mniah", {}).get("summary", {})
-    if not mniah:
+    single = data.get("single_needle_niah", {})
+    multi = data.get("multi_needle_mniah", data.get("option_b_mniah", {}).get("summary", {}))
+    if not single and not multi:
         return
 
-    fig, ax = plt.subplots(figsize=(9, 4.8))
-    policies = list(mniah.keys())
-    labels = [p.replace("_", " ").title() for p in policies]
-    recalls = [mniah[p]["mean_needle_recall"] * 100.0 for p in policies]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+    policies = ["fp16_reference", "sink_recent_fp16", "question_aware_fp16", "token_wise_int4", "channel_k_token_v_int4", "hybrid_fp16_int2"]
+    labels = ["FP16 Ref", "Sink+Recent", "SnapKV", "Token INT4", "Channel INT4", "Hybrid INT2"]
     colors = ["#2c3e50", "#e74c3c", "#3498db", "#9b59b6", "#27ae60", "#f39c12"]
 
-    bars = ax.bar(labels, recalls, color=colors[:len(labels)], width=0.55, edgecolor="black", linewidth=0.8)
-    ax.set_ylabel("Multi-Needle Recall (%)")
-    ax.set_title("Context Memory Benchmark: Multi-Needle in a Haystack (M-NIAH, 2k/4k Tokens)")
-    ax.set_ylim(0, 105)
-    ax.grid(True, linestyle="--", alpha=0.5, axis="y")
-    plt.xticks(rotation=20, ha="right")
-
-    for bar in bars:
+    # 1. Single-Needle NIAH
+    ax1 = axes[0]
+    single_scores = [single.get(p, {}).get("mean_accuracy", 0.0) * 100.0 for p in policies]
+    bars1 = ax1.bar(labels, single_scores, color=colors, width=0.55, edgecolor="black", linewidth=0.8)
+    ax1.set_ylabel("Exact Match Accuracy (%)")
+    ax1.set_title("Single-Needle in a Haystack (NIAH K=1, 2k/4k Tokens)")
+    ax1.set_ylim(0, 110)
+    ax1.grid(True, linestyle="--", alpha=0.5, axis="y")
+    ax1.tick_params(axis="x", rotation=25)
+    for bar in bars1:
         yval = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2.0, yval + 1.5, f"{yval:.1f}%", ha="center", va="bottom", fontweight="bold", fontsize=9)
+        ax1.text(bar.get_x() + bar.get_width() / 2.0, yval + 1.5, f"{yval:.1f}%", ha="center", va="bottom", fontweight="bold", fontsize=8.5)
+
+    # 2. Multi-Needle M-NIAH
+    ax2 = axes[1]
+    multi_scores = [multi.get(p, {}).get("mean_needle_recall", 0.0) * 100.0 for p in policies]
+    bars2 = ax2.bar(labels, multi_scores, color=colors, width=0.55, edgecolor="black", linewidth=0.8)
+    ax2.set_ylabel("Multi-Needle Recall (%)")
+    ax2.set_title("Multi-Needle in a Haystack (M-NIAH K∈{2,4,8}, 2k/4k Tokens)")
+    ax2.set_ylim(0, 110)
+    ax2.grid(True, linestyle="--", alpha=0.5, axis="y")
+    ax2.tick_params(axis="x", rotation=25)
+    for bar in bars2:
+        yval = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width() / 2.0, yval + 1.5, f"{yval:.1f}%", ha="center", va="bottom", fontweight="bold", fontsize=8.5)
 
     out_path = FIGURES_DIR / "task2_context_mniah_recall.png"
     plt.savefig(out_path, dpi=300)

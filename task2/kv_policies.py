@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Tuple
 import torch
+import torch.nn.functional as F
 
 from task2.config import (
     KV_SINK_TOKENS,
@@ -32,13 +33,23 @@ def compute_question_importance_scores(
     
     Args:
         k_cache: List of key tensors per layer, each (B, H_kv, L, d_h)
-        q_question: Query tensor of the question suffix, (B, H_q, L_q, d_h)
+        q_question: Query tensor of the question suffix (B, H_q, L_q, d_h) or precomputed 1D scores (L,)
         
     Returns:
-        importance: (L,) importance score per prompt position
+        importance: (L,) importance score per prompt position with 1D max pooling
     """
     device = k_cache[0].device
     L = k_cache[0].shape[2]
+
+    # If already a 1D importance score vector (e.g. from true layer attention)
+    if q_question.ndim == 1:
+        scores = q_question.to(device).float()
+        if len(scores) != L:
+            scores = F.interpolate(scores.view(1, 1, -1), size=L, mode="nearest").squeeze()
+        # 1D max pooling with kernel size 5 to capture neighboring tokens (entity/code clusters)
+        pooled = F.max_pool1d(scores.view(1, 1, -1), kernel_size=5, stride=1, padding=2).squeeze()
+        return pooled
+
     total_scores = torch.zeros(L, device=device, dtype=torch.float32)
 
     # Sample top/middle/bottom layers or all layers to accumulate attention
@@ -63,7 +74,9 @@ def compute_question_importance_scores(
             layer_imp = attn_probs.sum(dim=(0, 1, 2))  # (L,)
             total_scores += layer_imp
 
-    return total_scores
+    # Apply 1D max pooling of kernel size 5 to cluster tokens
+    pooled_total = F.max_pool1d(total_scores.view(1, 1, -1), kernel_size=5, stride=1, padding=2).squeeze()
+    return pooled_total
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,19 +185,42 @@ def apply_policy_channel_k_token_v_int4(
     k_list: List[torch.Tensor],
     v_list: List[torch.Tensor],
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-    """Policy 4: Group-64 INT4 along tokens for K, and along hidden channels for V."""
+    """Policy 4: Group-64 INT4 along tokens for K, and along hidden channels for V,
+    with 8 sink tokens and 64 recent streaming buffer tokens preserved in FP16 (KIVI specification).
+    """
     L = k_list[0].shape[2]
+    device = k_list[0].device
     k_out = []
     v_out = []
     total_bytes = 0
 
+    sink_count = min(KV_SINK_TOKENS, L)
+    recent_count = min(KV_RECENT_TOKENS, max(0, L - sink_count))
+    mid_start = sink_count
+    mid_end = max(sink_count, L - recent_count)
+
     for k, v in zip(k_list, v_list):
-        k_deq, v_deq, layer_bytes = quantize_channel_k_token_v(k, v, bits=4, group_size=KV_GROUP_SIZE)
-        k_out.append(k_deq)
-        v_out.append(v_deq)
+        k_layer = k.clone()
+        v_layer = v.clone()
+        layer_bytes = 0
+
+        # Account for FP16 sink + recent streaming buffer
+        num_fp16 = sink_count + recent_count
+        layer_bytes += num_fp16 * (k.shape[1] * k.shape[3] * 4)
+
+        if mid_end > mid_start:
+            k_mid = k[:, :, mid_start:mid_end, :]
+            v_mid = v[:, :, mid_start:mid_end, :]
+            k_mid_deq, v_mid_deq, mid_bytes = quantize_channel_k_token_v(k_mid, v_mid, bits=4, group_size=KV_GROUP_SIZE)
+            k_layer[:, :, mid_start:mid_end, :] = k_mid_deq
+            v_layer[:, :, mid_start:mid_end, :] = v_mid_deq
+            layer_bytes += mid_bytes
+
+        k_out.append(k_layer)
+        v_out.append(v_layer)
         total_bytes += layer_bytes
 
-    keep_indices = torch.arange(L, device=k_list[0].device)
+    keep_indices = torch.arange(L, device=device)
     return k_out, v_out, keep_indices, total_bytes
 
 

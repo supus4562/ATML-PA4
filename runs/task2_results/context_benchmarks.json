@@ -1,30 +1,65 @@
 {
-  "option_a_oolong": {
-    "status": "aborted_floor_effect",
-    "base_fp16_score": 0.1,
-    "conclusion": "Model capacity floor effect: 1.5B model fails atomic aggregation even in FP16."
-  },
-  "option_b_mniah": {
-    "status": "completed",
-    "summary": {
-      "fp16_reference": {
-        "mean_needle_recall": 0.75
-      },
-      "sink_recent_fp16": {
-        "mean_needle_recall": 0.1388888888888889
-      },
-      "question_aware_fp16": {
-        "mean_needle_recall": 0.3958333333333333
-      },
-      "token_wise_int4": {
-        "mean_needle_recall": 0.18055555555555555
-      },
-      "channel_k_token_v_int4": {
-        "mean_needle_recall": 0.125
-      },
-      "hybrid_fp16_int2": {
-        "mean_needle_recall": 0.08333333333333333
-      }
+  "single_needle_niah": {
+    "fp16_reference": {
+      "mean_accuracy": 1.0
+    },
+    "sink_recent_fp16": {
+      "mean_accuracy": 0.3333333333333333
+    },
+    "question_aware_fp16": {
+      "mean_accuracy": 1.0
+    },
+    "token_wise_int4": {
+      "mean_accuracy": 0.16666666666666666
+    },
+    "channel_k_token_v_int4": {
+      "mean_accuracy": 0.0
+    },
+    "hybrid_fp16_int2": {
+      "mean_accuracy": 0.0
     }
+  },
+  "multi_needle_mniah": {
+    "fp16_reference": {
+      "mean_needle_recall": 0.5208333333333334
+    },
+    "sink_recent_fp16": {
+      "mean_needle_recall": 0.125
+    },
+    "question_aware_fp16": {
+      "mean_needle_recall": 0.625
+    },
+    "token_wise_int4": {
+      "mean_needle_recall": 0.1875
+    },
+    "channel_k_token_v_int4": {
+      "mean_needle_recall": 0.0
+    },
+    "hybrid_fp16_int2": {
+      "mean_needle_recall": 0.0
+    }
+  },
+  "variable_tracking": {
+    "fp16_reference": {
+      "mean_accuracy": 0.0
+    },
+    "sink_recent_fp16": {
+      "mean_accuracy": 0.0
+    },
+    "question_aware_fp16": {
+      "mean_accuracy": 0.0
+    },
+    "token_wise_int4": {
+      "mean_accuracy": 0.0
+    },
+    "channel_k_token_v_int4": {
+      "mean_accuracy": 0.0
+    },
+    "hybrid_fp16_int2": {
+      "mean_accuracy": 0.0
+    }
+  },
+  "rope_frequency_study": {
+    "status": "unsupported_architecture"
   }
 }

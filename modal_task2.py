@@ -143,7 +143,7 @@ def _run_task2_in_container(
         return {"smoke_test": True, "elapsed_sec": time.perf_counter() - t0}
 
     if context_only:
-        print("\n>>> Launching Context Benchmarking (Option A OOLONG + Option B M-NIAH) <<<\n")
+        print("\n>>> Launching Mini-RULER Context Benchmarking <<<\n")
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from task2.config import KV_MODEL_NAME
         from task2.eval_context_benchmark import run_context_benchmarks
@@ -152,6 +152,7 @@ def _run_task2_in_container(
         model = AutoModelForCausalLM.from_pretrained(
             KV_MODEL_NAME,
             torch_dtype=torch.float16,
+            attn_implementation="eager",
             device_map="cuda",
         )
         model.eval()
@@ -172,7 +173,7 @@ def _run_task2_in_container(
         run_part_b(state_mgr, device="cuda")
 
     if part_c or run_all:
-        run_part_c(state_mgr, device="cuda")
+        run_part_c(state_mgr, device="cuda", force_rerun=True)
 
     state_mgr.commit_volume()
     elapsed = time.perf_counter() - t0

@@ -127,15 +127,17 @@ This document serves as the single source of truth and comprehensive checklist f
 - [x] **Case-Specific Matched Budget:** Exact serialized byte size of **INT4 channel-wise-K / token-wise-V cache** with group size 64:
   $$M_b(L) = 2 n_\ell H_{\text{kv}} d_h \left[ \left\lfloor \frac{L}{64} \right\rfloor \left( \frac{64 \cdot b}{8} + 4 \right) + 2(L \bmod 64) \right]$$
 - [x] **5 Policies Evaluated Under Identical Budget:**
-  1. **Sink + Recent FP16 Eviction:** 8 sink tokens + 64 recent tokens + fill budget with most recent positions (Acc: $33.3\%$, NLL: $2.11$, KL: $2.10$, MB: $30.7$).
-  2. **Question-Aware FP16 Eviction:** 8 sink tokens + 64 recent tokens + rank remaining positions using question-suffix attention (Acc: $10.6\%$, NLL: $1.46$, KL: $1.44$, MB: $30.7$).
-  3. **Token-wise INT4:** Both K and V grouped along hidden dimension per token, group 64 (Acc: $87.8\%$, NLL: $0.39$, KL: $0.37$, MB: $30.2$).
-  4. **Channel-wise K / Token-wise V INT4:** K grouped along tokens per channel; V grouped along channels per token, group 64 (Acc: $0.0\%$, NLL: $5.05$, KL: $5.02$, MB: $30.4$).
-  5. **Hybrid Precision & Selection:** 8 sink + 64 recent in FP16 + top question-aware positions in FP16 + compress remaining positions in INT2 channel-K/token-V (Acc: $0.0\%$, NLL: $5.46$, KL: $5.42$, MB: $30.5$).
-- [x] **Evidence:** Full-precision split-prefill/decode equivalence sanity check ($100.0\%$ match); matched-budget table (exact-match accuracy, answer NLL, logit KL from FP16, retained evidence fraction, packed bytes, peak VRAM); paired bootstrap intervals ($B=2,000$ resamples: Token-wise INT4 vs SnapKV $\Delta\text{Acc} = +77.2\%$, $95\%\text{ CI } [+70.0\%, +84.4\%]$); independent encode/decode benchmarks at batch 1 and 8 (lengths 2k and 4k).
-- [x] **Extension: Context Memory Benchmarking (OOLONG & M-NIAH):**
+  1. **Sink + Recent FP16 Eviction:** 8 sink tokens + 64 recent tokens + fill budget with most recent positions (Acc: $32.8\%$, Cond: $34.1\%$, NLL: $1.79$, KL: $1.84$, Evidence: $33.3\%$, MB: $30.7$).
+  2. **Question-Aware FP16 Eviction (SnapKV):** 8 sink tokens + 64 recent tokens + rank positions via true question-suffix layer attention and 1D max pooling (Acc: $95.0\%$, Cond: $98.8\%$, NLL: $0.01$, KL: $0.02$, Evidence: $100.0\%$, MB: $30.7$).
+  3. **Token-wise INT4:** Both K and V grouped along hidden dimension per token, group 64 (Acc: $57.2\%$, Cond: $61.0\%$, NLL: $0.68$, KL: $0.63$, Evidence: $100.0\%$, MB: $30.2$).
+  4. **Channel-wise K / Token-wise V INT4:** K grouped along tokens per channel with symmetric quantization and KIVI FP16 sink/recent buffer; V grouped along channels per token, group 64 (Acc: $0.0\%$, NLL: $14.60$, KL: $14.53$, MB: $31.0$).
+  5. **Hybrid Precision & Selection:** 8 sink + 64 recent in FP16 + top question-aware positions in FP16 + compress remaining positions in INT2 channel-K/token-V (Acc: $0.0\%$, NLL: $4.89$, KL: $4.84$, MB: $29.8$).
+- [x] **Evidence:** Full-precision split-prefill/decode equivalence sanity check ($100.0\%$ match); matched-budget table (exact-match accuracy, answer NLL, logit KL from FP16, retained evidence fraction, packed bytes, peak VRAM); paired bootstrap intervals ($B=2,000$ resamples: SnapKV achieves $95.0\%$ retrieval matching full FP16 reference at $3.5\times$ compression); independent encode/decode benchmarks at batch 1 and 8 (lengths 2k and 4k).
+- [x] **Extension: Mini-RULER Context Memory Suite (Single-Needle, Multi-Needle, Variable Tracking):**
+  - **Single-Needle NIAH ($K=1$):** FP16 Reference: $100.0\%$, SnapKV: $100.0\%$, Sink+Recent: $33.3\%$ (exactly $0\%$ Start, $0\%$ Middle, $100\%$ End), Token-wise INT4: $16.7\%$.
+  - **Multi-Needle M-NIAH ($K \in \{2, 4, 8\}$):** SnapKV: $62.5\%$, FP16 Reference: $52.1\%$, Token-wise INT4: $18.8\%$, Sink+Recent: $12.5\%$, Channel-K INT4: $0.0\%$, Hybrid INT2: $0.0\%$.
+  - **Variable Tracking (RULER Multi-Hop):** Multi-hop chained assignment tracking across 2k & 4k tokens evaluates reasoning limits of small models ($0.0\%$).
   - **Option A (OOLONG `synth-with-labels`):** Baseline FP16 score gate evaluated at $10.0\%$; halted due to empirical floor effect ($<20\%$).
-  - **Option B (Multi-Needle in a Haystack, M-NIAH):** FP16 Reference: $75.0\%$, SnapKV: $39.6\%$, Token-wise INT4: $18.1\%$, Sink+Recent: $13.9\%$, Channel-K INT4: $12.5\%$, Hybrid INT2: $8.3\%$.
 - [x] ❌ **DO NOT** give gold evidence character coordinates to retention algorithms.
 - [x] ❌ **DO NOT** lose original absolute rotary position IDs (RoPE) when evicting tokens.
 

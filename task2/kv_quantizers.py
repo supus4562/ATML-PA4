@@ -14,14 +14,16 @@ def quantize_affine_group(
     bits: int = 4,
     group_size: int = KV_GROUP_SIZE,
     dim: int = -1,
+    symmetric: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Asymmetric affine quantization along a specified dimension in groups of group_size.
+    """Affine or symmetric quantization along a specified dimension in groups of group_size.
     
     Args:
         tensor: Floating-point tensor on GPU
         bits: Target integer bit-width (4 or 2)
         group_size: Quantization group size (64)
         dim: Dimension to group along
+        symmetric: If True, uses zero-centered symmetric quantization (zero=0, no DC bias)
         
     Returns:
         dequant: Dequantized tensor in original dtype
@@ -50,23 +52,28 @@ def quantize_affine_group(
     t_full = t[..., :full_len]
     t_rem = t[..., full_len:]
 
-    q_max = (1 << bits) - 1
-
     # Reshape full groups to (..., num_groups, group_size)
     reshaped = t_full.view(*t_full.shape[:-1], num_full_groups, group_size)
 
-    # Compute min and max along group axis
-    w_min = torch.amin(reshaped, dim=-1, keepdim=True)
-    w_max = torch.amax(reshaped, dim=-1, keepdim=True)
-
-    # Compute scale and zero point
-    scale = ((w_max - w_min) / float(q_max)).clamp_min(1e-8)
-    zero = torch.round(-w_min / scale).clamp(0, q_max)
-
-    # Quantize and dequantize
-    q_int = torch.clamp(torch.round(reshaped / scale) + zero, 0, q_max)
-    dequant_full = (q_int - zero) * scale
-    dequant_full = dequant_full.view_as(t_full).to(orig_dtype)
+    if symmetric:
+        # Signed symmetric quantization: zero point is exactly 0
+        q_bound = (1 << (bits - 1)) - 1
+        w_abs_max = torch.amax(torch.abs(reshaped), dim=-1, keepdim=True)
+        scale = (w_abs_max / float(q_bound)).clamp_min(1e-8)
+        zero = torch.zeros_like(scale)
+        q_int = torch.clamp(torch.round(reshaped / scale), -q_bound, q_bound)
+        dequant_full = (q_int * scale).view_as(t_full).to(orig_dtype)
+        meta_bytes_per_group = 2  # Only FP16 scale, zero point is implicit 0
+    else:
+        # Asymmetric min-max quantization
+        q_max = (1 << bits) - 1
+        w_min = torch.amin(reshaped, dim=-1, keepdim=True)
+        w_max = torch.amax(reshaped, dim=-1, keepdim=True)
+        scale = ((w_max - w_min) / float(q_max)).clamp_min(1e-8)
+        zero = torch.round(-w_min / scale).clamp(0, q_max)
+        q_int = torch.clamp(torch.round(reshaped / scale) + zero, 0, q_max)
+        dequant_full = ((q_int - zero) * scale).view_as(t_full).to(orig_dtype)
+        meta_bytes_per_group = 4  # FP16 scale + FP16 zero
 
     # Trailing tokens remain full precision FP16
     if rem > 0:
@@ -78,16 +85,12 @@ def quantize_affine_group(
     if perm is not None:
         dequant = dequant.permute(perm).contiguous()
 
-    # Exact serialized byte accounting:
-    # Payload: num_groups * (group_size * bits / 8)
-    # Metadata: num_groups * 4 bytes (FP16 scale + FP16 zero)
-    # Trailing: rem * 2 bytes (FP16)
     total_elements = tensor.numel()
     num_total_groups = (total_elements // L) * num_full_groups
     num_total_rem = (total_elements // L) * rem
 
     payload_bytes = num_total_groups * ((group_size * bits) // 8)
-    meta_bytes = num_total_groups * 4
+    meta_bytes = num_total_groups * meta_bytes_per_group
     rem_bytes = num_total_rem * 2
     total_bytes = payload_bytes + meta_bytes + rem_bytes
 
@@ -113,9 +116,9 @@ def quantize_channel_k_token_v(
     bits: int = 4,
     group_size: int = KV_GROUP_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Policy 4: Channel-wise-K (group 64 along tokens) and Token-wise-V (group 64 along hidden channels)."""
-    # K shape: (B, H, L, d_h). Grouping along dim 2 (token sequence length L)
-    k_deq, _, _, k_bytes = quantize_affine_group(k, bits=bits, group_size=group_size, dim=2)
+    """Policy 4: Channel-wise-K (group 64 along tokens, symmetric) and Token-wise-V (group 64 along hidden channels)."""
+    # K shape: (B, H, L, d_h). Grouping along dim 2 (token sequence length L) with symmetric quantization
+    k_deq, _, _, k_bytes = quantize_affine_group(k, bits=bits, group_size=group_size, dim=2, symmetric=True)
     # V shape: (B, H, L, d_h). Grouping along dim 3 (hidden dim d_h)
-    v_deq, _, _, v_bytes = quantize_affine_group(v, bits=bits, group_size=group_size, dim=-1)
+    v_deq, _, _, v_bytes = quantize_affine_group(v, bits=bits, group_size=group_size, dim=-1, symmetric=False)
     return k_deq, v_deq, k_bytes + v_bytes

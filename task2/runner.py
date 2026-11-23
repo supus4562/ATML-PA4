@@ -175,9 +175,14 @@ def run_part_b(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
     return part_b_results
 
 
-def run_part_c(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: bool = False) -> Dict[str, Any]:
+def run_part_c(
+    state_mgr: Task2StateManager,
+    device: str = "cuda",
+    smoke_test: bool = False,
+    force_rerun: bool = False,
+) -> Dict[str, Any]:
     """Execute Part C: Pretrained KV Memory Compression across the 5 matched-budget policies."""
-    if state_mgr.is_completed("part_c_full") and not smoke_test:
+    if state_mgr.is_completed("part_c_full") and not force_rerun and not smoke_test:
         print("\n[Resume] Part C already completed. Skipping.")
         return state_mgr.get_part_c()
 
@@ -186,11 +191,12 @@ def run_part_c(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
     print("STEP 3: RUNNING PART C (PRETRAINED KV MEMORY COMPRESSION)")
     print("=" * 80)
 
-    print(f"Loading '{KV_MODEL_NAME}' in FP16 on {device}...")
+    print(f"Loading '{KV_MODEL_NAME}' in Bfloat16 on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(KV_MODEL_NAME, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         KV_MODEL_NAME,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
         device_map=device,
     )
     model.eval()
@@ -206,11 +212,11 @@ def run_part_c(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
     if not smoke_test:
         state_mgr.record_part_c(kv_results)
 
-        # Extension: Run Context Benchmarks (Option A OOLONG baseline check + Option B M-NIAH)
+        # Extension: Run Complete Mini-RULER Context Benchmarks
         try:
             from task2.eval_context_benchmark import run_context_benchmarks
             print("\n" + "=" * 80)
-            print("STEP 4: RUNNING CONTEXT BENCHMARKS (OPTION A OOLONG + OPTION B M-NIAH)")
+            print("STEP 4: RUNNING MINI-RULER CONTEXT BENCHMARKS")
             print("=" * 80)
             ctx_results = run_context_benchmarks(model=model, tokenizer=tokenizer, device=device)
             state_mgr.state["context_benchmarks"] = ctx_results
