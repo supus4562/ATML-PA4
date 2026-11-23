@@ -1,0 +1,30 @@
+{
+  "option_a_oolong": {
+    "status": "aborted_floor_effect",
+    "base_fp16_score": 0.1,
+    "conclusion": "Model capacity floor effect: 1.5B model fails atomic aggregation even in FP16."
+  },
+  "option_b_mniah": {
+    "status": "completed",
+    "summary": {
+      "fp16_reference": {
+        "mean_needle_recall": 0.75
+      },
+      "sink_recent_fp16": {
+        "mean_needle_recall": 0.1388888888888889
+      },
+      "question_aware_fp16": {
+        "mean_needle_recall": 0.3958333333333333
+      },
+      "token_wise_int4": {
+        "mean_needle_recall": 0.18055555555555555
+      },
+      "channel_k_token_v_int4": {
+        "mean_needle_recall": 0.125
+      },
+      "hybrid_fp16_int2": {
+        "mean_needle_recall": 0.08333333333333333
+      }
+    }
+  }
+}
