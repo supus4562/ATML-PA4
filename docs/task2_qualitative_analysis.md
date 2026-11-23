@@ -1,4 +1,4 @@
-# ATML PA4 — Task 2: Qualitative Analysis & Mechanistic Case Studies
+# Efficient Attention & Context Memory: Qualitative Analysis & Mechanistic Case Studies
 
 This document provides qualitative prompt-level evaluations and mechanistic explanations across the three components of **Task 2: Efficient Attention & Context Memory**.
 

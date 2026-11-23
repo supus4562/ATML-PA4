@@ -1,11 +1,11 @@
-# ATML Programming Assignment 4 (Fall 2026)
+# High-Performance LLM Efficiency Suite: Hardware-Aware Attention, Compression & Context Memory
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.4+](https://img.shields.io/badge/pytorch-2.4%2B-ee4c2c.svg)](https://pytorch.org/)
 [![Transformers 4.57.1](https://img.shields.io/badge/transformers-4.57.1-yellow.svg)](https://huggingface.co/docs/transformers)
 [![Modal](https://img.shields.io/badge/cloud-Modal%20Serverless%20GPU-green.svg)](https://modal.com)
 
-Comprehensive implementation, 100% serverless cloud GPU benchmarking, and empirical analysis for **ATML Programming Assignment 4: Model Compression, Efficient Attention, and Context Memory**.
+Comprehensive implementation, 100% serverless cloud GPU benchmarking, and empirical research suite for **Model Compression (AWQ, Wanda 2:4), Tiled Online-Softmax Causal Attention, and Long-Context KV Cache Memory (SnapKV, INT4)**.
 
 ---
 
