@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from task1.calibration import ActivationStats
 from task1.pruners import get_eligible_linear_modules
-from task1.quantizers import quantize_weight_asymmetric
+from task1.quantizers import awq_quantize_layer, quantize_weight_asymmetric
 
 
 def compute_activation_outlier_metrics(
@@ -38,13 +38,20 @@ def profile_layer_pruning_sensitivity(
     activation_stats: ActivationStats,
     eligible_projections: tuple[str, ...],
     candidate_sparsities: tuple[float, ...] = (0.25, 0.50, 0.75),
-) -> Dict[str, Dict[float, float]]:
+    return_absolute: bool = False,
+):
     """Measure layer-wise output reconstruction error ||Y - Y_pruned||_F^2 / ||Y||_F^2 under Wanda pruning.
+
+    With `return_absolute=True` also returns the un-normalized mean squared output error
+    ||Y - Y_pruned||_F^2 / N. The relative measure is dominated by massive-activation
+    channels (e.g. early down_proj layers) and can rank those layers as "insensitive";
+    the absolute measure is kept as an alternative design selected on the dev split.
 
     Evaluated directly on GPU using cached calibration sample activations.
     """
     eligible_modules = get_eligible_linear_modules(model, eligible_projections)
     sensitivity_curve: Dict[str, Dict[float, float]] = {}
+    absolute_curve: Dict[str, Dict[float, float]] = {}
 
     print(f"\n[Sensitivity] Profiling pruning sensitivity across {len(eligible_modules)} layers...")
 
@@ -66,10 +73,12 @@ def profile_layer_pruning_sensitivity(
             scores = torch.abs(w) * l2_norm
 
             sensitivity_curve[name] = {}
+            absolute_curve[name] = {}
             for s in candidate_sparsities:
                 k_prune = int(round(s * in_features))
                 if k_prune <= 0:
                     sensitivity_curve[name][s] = 0.0
+                    absolute_curve[name][s] = 0.0
                     continue
 
                 thresh = torch.topk(scores, k=k_prune, largest=False, dim=-1).values[:, -1:]
@@ -77,9 +86,12 @@ def profile_layer_pruning_sensitivity(
                 w_pruned = w.float() * mask.float()
 
                 y_pruned = sample_x @ w_pruned.t()
-                rel_err = float((torch.sum((y_target - y_pruned) ** 2) / y_norm).item())
-                sensitivity_curve[name][s] = rel_err
+                sq_err = torch.sum((y_target - y_pruned) ** 2)
+                sensitivity_curve[name][s] = float((sq_err / y_norm).item())
+                absolute_curve[name][s] = float((sq_err / sample_x.shape[0]).item())
 
+    if return_absolute:
+        return sensitivity_curve, absolute_curve
     return sensitivity_curve
 
 
@@ -117,3 +129,32 @@ def profile_layer_quantization_sensitivity(
                 sensitivity_curve[name][b] = rel_err
 
     return sensitivity_curve
+
+
+def profile_layer_awq_quantization_sensitivity(
+    model: nn.Module,
+    activation_stats: ActivationStats,
+    eligible_projections: tuple[str, ...],
+    candidate_bits: tuple[int, ...] = (2, 3, 4, 8),
+    group_size: int = 128,
+    candidate_alphas: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+) -> Dict[str, Dict[str, Dict[int, float]]]:
+    """Isolated per-projection calibration output error of the SAME AWQ quantizer Q3 applies.
+
+    Returns {"absolute": {name: {b: MSE}}, "relative": {name: {b: rel_err}}}. The absolute
+    measure weights projections by how much output energy they actually perturb; the relative
+    measure ignores output scale. Which one drives the allocation is chosen on the dev split.
+    """
+    absolute: Dict[str, Dict[int, float]] = {}
+    relative: Dict[str, Dict[int, float]] = {}
+    print(f"\n[Sensitivity] Profiling AWQ quantization sensitivity at bits {candidate_bits}...")
+    with torch.no_grad():
+        for name, module in get_eligible_linear_modules(model, eligible_projections).items():
+            absolute[name], relative[name] = {}, {}
+            for b in candidate_bits:
+                _, err, rel = awq_quantize_layer(
+                    module.weight.data, activation_stats.sample_inputs.get(name),
+                    activation_stats.get_mean_abs(name), b, group_size, candidate_alphas,
+                )
+                absolute[name][b], relative[name][b] = err, rel
+    return {"absolute": absolute, "relative": relative}

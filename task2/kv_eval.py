@@ -1,365 +1,307 @@
-"""task2/kv_eval.py — Complete evaluation suite for Task 2 Part C (Pretrained KV Memory Compression).
+"""task2/kv_eval.py — Task 2 Part C evaluation (C1 validation, C2–C4 policies, C5 metrics).
+
+Model: Qwen/Qwen2.5-1.5B-Instruct, FP16, SDPA attention (the working generation path).
+Reference answer: the unchanged FP16 model's own greedy answer tokens for that prompt.
 """
 
 from __future__ import annotations
 
-import gc
 import gzip
 import json
-import math
 import re
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from task2.config import (
-    REPO_ROOT,
-    KV_MODEL_NAME,
-    KV_BOOTSTRAP_RESAMPLES,
-    KV_BENCHMARK_REPETITIONS,
-    KV_BENCHMARK_BATCHES,
+from task2.config import REPO_ROOT, KV_BOOTSTRAP_RESAMPLES
+from task2.kv_cache_models import compute_matched_int4_bytes, compute_uncompressed_fp16_bytes
+from task2.kv_core import (
+    EOS_IDS,
+    build_cache,
+    greedy_decode,
+    policy_tail_state,
+    prefill_question,
+    question_importance,
+    teacher_forced_logprobs,
 )
-from task2.kv_cache_models import (
-    compute_matched_int4_bytes,
-    compute_uncompressed_fp16_bytes,
-)
-from task2.kv_policies import (
-    apply_policy_sink_recent,
-    apply_policy_question_aware,
-    apply_policy_token_wise_int4,
-    apply_policy_channel_k_token_v_int4,
-    apply_policy_hybrid,
-)
+from task2.kv_policies import POLICIES, apply_policy
+
+MAX_NEW_TOKENS = 48
+
+
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _reset_peak():
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _peak_mb() -> float:
+    return torch.cuda.max_memory_allocated() / 2**20 if torch.cuda.is_available() else float("nan")
 
 
 def load_retrieval_prompts() -> List[Dict]:
-    """Load the 180 factorial retrieval prompt cases from data/kv_retrieval/kv_retrieval_cases.jsonl.gz."""
     prompts_path = REPO_ROOT / "data" / "kv_retrieval" / "kv_retrieval_cases.jsonl.gz"
-    if not prompts_path.exists():
-        raise FileNotFoundError(f"Required prompt file not found: {prompts_path}")
-
-    records = []
     with gzip.open(prompts_path, "rt", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    return records
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def extract_five_digit_code(text: str) -> Optional[str]:
-    """Deterministic extractor for the 5-digit passcode answer."""
-    matches = re.findall(r"\b\d{5}\b", text)
-    return matches[0] if matches else None
+    """Deterministic extractor: first standalone 5-digit number in the answer."""
+    m = re.findall(r"\b\d{5}\b", text)
+    return m[0] if m else None
 
 
-def compute_paired_bootstrap_ci(
-    diffs: List[float],
-    b_resamples: int = KV_BOOTSTRAP_RESAMPLES,
-    seed: int = 6304,
-) -> Dict[str, float]:
-    """Compute 95% paired bootstrap confidence interval."""
-    if not diffs:
-        return {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0}
-    rng = np.random.RandomState(seed)
-    n = len(diffs)
-    arr = np.array(diffs, dtype=np.float64)
-    boot_means = np.empty(b_resamples, dtype=np.float64)
-    for i in range(b_resamples):
-        indices = rng.randint(0, n, size=n)
-        boot_means[i] = np.mean(arr[indices])
-    return {
-        "mean": float(np.mean(arr)),
-        "ci_lower": float(np.percentile(boot_means, 2.5)),
-        "ci_upper": float(np.percentile(boot_means, 97.5)),
-    }
+def paired_bootstrap(diffs: List[float], b: int = KV_BOOTSTRAP_RESAMPLES, seed: int = 6304) -> Dict[str, float]:
+    arr = np.asarray(diffs, dtype=np.float64)
+    if arr.size == 0:
+        return {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "n": 0}
+    rng = np.random.default_rng(seed)
+    boots = arr[rng.integers(0, arr.size, size=(b, arr.size))].mean(axis=1)
+    return {"mean": float(arr.mean()), "ci_lower": float(np.percentile(boots, 2.5)),
+            "ci_upper": float(np.percentile(boots, 97.5)), "n": int(arr.size), "resamples": b}
 
 
-def evaluate_kv_prompt_case(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    prompt_record: Dict,
-    policy_name: str,
-    device: str = "cuda",
-    precomputed_cache: Optional[Tuple[List[torch.Tensor], List[torch.Tensor], Any]] = None,
-    return_precomputed: bool = False,
-) -> Any:
-    """Evaluate a single long-context prompt under a specific cache policy with RoPE-preserved greedy decode."""
-    user_text = prompt_record.get("user_text", prompt_record.get("prompt", ""))
-    gold_code = str(prompt_record.get("code", prompt_record.get("target_code", "")))
-    evidence_text = prompt_record.get("evidence_text", "")
-
-    # Format user text through the official chat template
-    full_chat = tokenizer.apply_chat_template(
-        [{"role": "user", "content": user_text}],
-        tokenize=False,
-        add_generation_prompt=True,
+def split_prompt(tokenizer, record: Dict):
+    chat = tokenizer.apply_chat_template(
+        [{"role": "user", "content": record["user_text"]}], tokenize=False, add_generation_prompt=True
     )
-
-    # Split into context body and question suffix at QUESTION_BEGIN
-    if "QUESTION_BEGIN" in full_chat:
-        ctx_part, q_part = full_chat.split("QUESTION_BEGIN", 1)
-        q_part = "QUESTION_BEGIN" + q_part
+    if "QUESTION_BEGIN" in chat:
+        ctx, q = chat.split("QUESTION_BEGIN", 1)
+        q = "QUESTION_BEGIN" + q
     else:
-        split_idx = max(0, len(full_chat) - 200)
-        ctx_part = full_chat[:split_idx]
-        q_part = full_chat[split_idx:]
+        raise ValueError(f"Prompt {record.get('id')} has no QUESTION_BEGIN marker")
+    return ctx, q
 
-    enc_context = tokenizer(ctx_part, return_tensors="pt", add_special_tokens=False).to(device)
-    enc_question = tokenizer(q_part, return_tensors="pt", add_special_tokens=False).to(device)
 
-    L_ctx = enc_context.input_ids.shape[1]
-    L_q = enc_question.input_ids.shape[1]
+def evidence_token_positions(tokenizer, ctx_text: str, evidence_text: str) -> List[int]:
+    start = ctx_text.find(evidence_text)
+    if start < 0:
+        return []
+    end = start + len(evidence_text)
+    offsets = tokenizer(ctx_text, return_offsets_mapping=True, add_special_tokens=False)["offset_mapping"]
+    return [i for i, (s, e) in enumerate(offsets) if max(s, start) < min(e, end)]
 
-    # 1. Prefill context or reuse cached past_key_values
-    if precomputed_cache is not None:
-        k_list = [k.clone() for k in precomputed_cache[0]]
-        v_list = [v.clone() for v in precomputed_cache[1]]
-        q_importance = precomputed_cache[2]
-    else:
-        with torch.no_grad():
-            out_ctx = model(**enc_context, use_cache=True)
-            pkv = out_ctx.past_key_values
 
-        k_list = [pkv[i][0].clone() for i in range(len(pkv))]
-        v_list = [pkv[i][1].clone() for i in range(len(pkv))]
+@torch.no_grad()
+def validate_fp16_reference(model, tokenizer, records: List[Dict], device: str = "cuda") -> Dict[str, Any]:
+    """C1: split-prefill equivalence, 100%-retention equivalence, finite logits."""
+    rows = []
+    for rec in records:
+        ctx, q = split_prompt(tokenizer, rec)
+        c_ids = tokenizer(ctx, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+        q_ids = tokenizer(q, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+        L = c_ids.shape[1]
+        full_ids = torch.cat([c_ids, q_ids], dim=1)
 
-        # Probe attention for SnapKV once per prompt
-        from transformers.cache_utils import DynamicCache
-        temp_cache = DynamicCache()
-        for layer_idx in range(len(k_list)):
-            temp_cache.update(k_list[layer_idx].clone(), v_list[layer_idx].clone(), layer_idx)
+        full_logits = model(input_ids=full_ids).logits[0, -1].float()
+        out_ctx = model(input_ids=c_ids, use_cache=True)
+        k_list = [out_ctx.past_key_values.layers[i].keys for i in range(len(model.model.layers))]
+        v_list = [out_ctx.past_key_values.layers[i].values for i in range(len(model.model.layers))]
+        split_logits = prefill_question(model, build_cache(k_list, v_list), q_ids, L, {"layout": None})[0]
 
-        q_pos = torch.arange(L_ctx, L_ctx + L_q, device=device).unsqueeze(0)
-        with torch.no_grad():
-            out_probe = model(
-                input_ids=enc_question.input_ids,
-                position_ids=q_pos,
-                past_key_values=temp_cache,
-                output_attentions=True,
-                use_cache=False,
-            )
-            if out_probe.attentions is not None:
-                num_layers = len(out_probe.attentions)
-                attn_acc = torch.zeros(L_ctx, device=device, dtype=torch.float32)
-                start_l = num_layers // 2
-                for l_idx in range(start_l, num_layers):
-                    ctx_attn = out_probe.attentions[l_idx][0, :, :, :L_ctx]
-                    attn_acc += ctx_attn.mean(dim=(0, 1)).float()
-                q_importance = attn_acc
-            else:
-                q_importance = torch.ones(L_ctx, device=device)
-
-    # 2. Apply chosen compression/eviction policy to context cache
-    if policy_name == "fp16_reference":
-        k_comp = k_list
-        v_comp = v_list
-        keep_indices = torch.arange(L_ctx, device=device)
-        actual_bytes = compute_uncompressed_fp16_bytes(L_ctx)
-    elif policy_name == "sink_recent_fp16":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_sink_recent(k_list, v_list)
-    elif policy_name == "question_aware_fp16":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_question_aware(k_list, v_list, q_importance)
-    elif policy_name == "token_wise_int4":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_token_wise_int4(k_list, v_list)
-    elif policy_name == "channel_k_token_v_int4":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_channel_k_token_v_int4(k_list, v_list)
-    elif policy_name == "hybrid_fp16_int2":
-        k_comp, v_comp, keep_indices, actual_bytes = apply_policy_hybrid(k_list, v_list, q_importance)
-    else:
-        raise ValueError(f"Unknown policy: {policy_name}")
-
-    # Calculate evidence retention fraction via exact character substring matching
-    retained_fraction = 1.0
-    if evidence_text:
-        char_start = ctx_part.find(evidence_text)
-        if char_start != -1:
-            char_end = char_start + len(evidence_text)
-            enc_offsets = tokenizer(ctx_part, return_offsets_mapping=True, add_special_tokens=False)
-            offsets = enc_offsets["offset_mapping"]
-            gold_token_indices = [
-                i for i, (s, e) in enumerate(offsets)
-                if max(s, char_start) < min(e, char_end)
-            ]
-            if gold_token_indices:
-                gold_positions = set(gold_token_indices)
-                retained_positions = set(keep_indices.cpu().numpy().tolist())
-                retained_fraction = len(gold_positions.intersection(retained_positions)) / float(len(gold_positions))
-            else:
-                retained_fraction = 0.0
-        else:
-            retained_fraction = 0.0
-
-    # 3. Prefill question suffix on top of compressed cache
-    from transformers.cache_utils import DynamicCache
-    compressed_cache = DynamicCache()
-    for layer_idx in range(len(k_comp)):
-        compressed_cache.update(k_comp[layer_idx], v_comp[layer_idx], layer_idx)
-
-    # Question position IDs: continue from context sequence length to maintain absolute RoPE alignment
-    past_len = keep_indices.shape[0]
-    question_pos_ids = torch.arange(L_ctx, L_ctx + L_q, device=device).unsqueeze(0)
-
-    with torch.no_grad():
-        out_q = model(
-            input_ids=enc_question.input_ids,
-            position_ids=question_pos_ids,
-            past_key_values=compressed_cache,
-            use_cache=True,
-        )
-        first_token_logits = out_q.logits[:, -1, :].clone()
-
-    # 4. Autoregressive greedy decode for up to 48 tokens to extract 5-digit code
-    curr_input = torch.argmax(first_token_logits, dim=-1, keepdim=True)
-    generated_tokens = [curr_input.item()]
-    curr_cache = out_q.past_key_values
-    curr_pos = L_ctx + L_q
-
-    with torch.no_grad():
-        for _ in range(47):
-            out_gen = model(
-                input_ids=curr_input,
-                position_ids=torch.tensor([[curr_pos]], device=device),
-                past_key_values=curr_cache,
-                use_cache=True,
-            )
-            curr_input = torch.argmax(out_gen.logits[:, -1, :], dim=-1, keepdim=True)
-            tok_id = curr_input.item()
-            generated_tokens.append(tok_id)
-            if tok_id in [tokenizer.eos_token_id, 151643, 151645]:
-                break
-            curr_cache = out_gen.past_key_values
-            curr_pos += 1
-
-    gen_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    pred_code = extract_five_digit_code(gen_text)
-    is_correct = (pred_code == gold_code)
-
-    # 5. Answer NLL: compute log probability of the true gold answer tokens
-    gold_ids = tokenizer(gold_code, add_special_tokens=False)["input_ids"]
-    answer_nll = 0.0
-    # Evaluate NLL using first token logits
-    if gold_ids:
-        log_probs = F.log_softmax(first_token_logits, dim=-1)
-        answer_nll = -log_probs[0, gold_ids[0]].item()
-
-    ret_dict = {
-        "prompt_id": prompt_record.get("id", "case"),
-        "policy": policy_name,
-        "is_correct": is_correct,
-        "predicted_code": pred_code,
-        "gold_code": gold_code,
-        "answer_nll": answer_nll,
-        "retained_evidence_fraction": retained_fraction,
-        "actual_packed_bytes": actual_bytes,
-        "first_logits": first_token_logits[0].cpu().half(),
-        "context_len": prompt_record.get("target_tokens", L_ctx),
-        "evidence_position": prompt_record.get("position", "middle"),
-        "distractors": prompt_record.get("distractors", 0),
+        # Ordinary HF greedy generation on the full prompt vs our edited-cache path at 100% retention.
+        gen = model.generate(full_ids, max_new_tokens=MAX_NEW_TOKENS, do_sample=False,
+                             eos_token_id=list(EOS_IDS), pad_token_id=EOS_IDS[0])
+        hf_tokens = gen[0, full_ids.shape[1]:].tolist()
+        cache = build_cache(k_list, v_list)
+        first = prefill_question(model, cache, q_ids, L, {"layout": None})
+        ours, _ = greedy_decode(model, cache, first, L + q_ids.shape[1], {"layout": None}, MAX_NEW_TOKENS)
+        rows.append({
+            "id": rec["id"],
+            "max_abs_logit_diff_full_vs_split": float((full_logits - split_logits).abs().max()),
+            "argmax_equal": bool(full_logits.argmax() == split_logits.argmax()),
+            "all_logits_finite": bool(torch.isfinite(full_logits).all() and torch.isfinite(split_logits).all()),
+            "full_retention_generation_matches_hf_generate": hf_tokens[: len(ours)] == ours,
+        })
+    return {
+        "cases": rows,
+        "max_abs_logit_diff": max(r["max_abs_logit_diff_full_vs_split"] for r in rows),
+        "all_argmax_equal": all(r["argmax_equal"] for r in rows),
+        "all_finite": all(r["all_logits_finite"] for r in rows),
+        "generation_match_rate": float(np.mean([r["full_retention_generation_matches_hf_generate"] for r in rows])),
+        "note": "FP16 SDPA; small logit differences between one-shot and split prefill are expected "
+                "from different kernel reduction orders.",
     }
-    if return_precomputed:
-        return ret_dict, (k_list, v_list, q_importance)
-    return ret_dict
 
 
-def run_full_kv_evaluation(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    device: str = "cuda",
-    max_cases: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Run evaluation across all 180 prompts and 5 policies + FP16 baseline."""
+@torch.no_grad()
+def evaluate_prompt(model, tokenizer, rec: Dict, device: str = "cuda") -> Dict[str, Dict[str, Any]]:
+    """Run all six cache conditions on one prompt with a shared FP16 context prefill."""
+    ctx, q = split_prompt(tokenizer, rec)
+    c_ids = tokenizer(ctx, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    q_ids = tokenizer(q, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    L, L_q = c_ids.shape[1], q_ids.shape[1]
+    gold = str(rec["code"])
+    gold_pos = set(evidence_token_positions(tokenizer, ctx, rec.get("evidence_text", "")))
+
+    _reset_peak()
+    _sync(); t0 = time.perf_counter()
+    out_ctx = model(input_ids=c_ids, use_cache=True)
+    _sync(); prefill_s = time.perf_counter() - t0
+    prefill_peak = _peak_mb()
+    n_layers = len(model.model.layers)
+    k_list = [out_ctx.past_key_values.layers[i].keys.clone() for i in range(n_layers)]
+    v_list = [out_ctx.past_key_values.layers[i].values.clone() for i in range(n_layers)]
+    del out_ctx
+
+    importance, scoring_s = question_importance(model, k_list, v_list, q_ids, L)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    ref_tokens: List[int] = []
+    ref_lp: Optional[torch.Tensor] = None
+    for name in POLICIES:
+        _reset_peak()
+        _sync(); t0 = time.perf_counter()
+        res = apply_policy(name, k_list, v_list, importance)
+        _sync(); policy_s = time.perf_counter() - t0
+
+        # Free-running greedy answer.
+        state = policy_tail_state(res)
+        cache = build_cache(res.k, res.v)
+        _sync(); t0 = time.perf_counter()
+        first = prefill_question(model, cache, q_ids, L, state)
+        _sync(); qprefill_s = time.perf_counter() - t0
+        tokens, decode_s = greedy_decode(model, cache, first, L + L_q, state, MAX_NEW_TOKENS)
+        decode_peak = _peak_mb()
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        pred = extract_five_digit_code(text)
+
+        if name == "fp16_reference":
+            ref_tokens = tokens
+        # Teacher-forced reference-answer NLL and per-position KL from FP16.
+        tf_cache = build_cache(res.k, res.v)
+        tf_first = prefill_question(model, tf_cache, q_ids, L, policy_tail_state(res))
+        lp = teacher_forced_logprobs(model, tf_cache, tf_first, ref_tokens, L + L_q)
+        tgt = torch.tensor(ref_tokens, device=lp.device)
+        ref_nll = float(-lp.gather(1, tgt[:, None]).mean())
+        if name == "fp16_reference":
+            ref_lp = lp
+        tf_kl = float((ref_lp.exp() * (ref_lp - lp)).sum(-1).mean())
+        first_kl = float((ref_lp[0].exp() * (ref_lp[0] - lp[0])).sum())
+
+        sel = None if res.fp16_selected is None else set(res.fp16_selected.tolist())
+        evid = None
+        if sel is not None and gold_pos:
+            evid = len(gold_pos & sel) / len(gold_pos)
+
+        # Live cache memory: compressed pre-question context + shared FP16 question/generated part.
+        shared_tokens = L_q + len(tokens)
+        shared_bytes = shared_tokens * (compute_uncompressed_fp16_bytes(1))
+        results[name] = {
+            "prompt_id": rec["id"], "policy": name, "context_len_tokens": L, "question_len_tokens": L_q,
+            "target_tokens": rec["target_tokens"], "evidence_position": rec["position"],
+            "distractors": rec["distractors"], "gold_code": gold, "predicted_code": pred,
+            "generated_text": text, "is_correct": pred == gold,
+            "reference_answer_nll": ref_nll, "teacher_forced_mean_kl": tf_kl, "post_prefill_kl": first_kl,
+            "retained_evidence_fraction": evid,
+            "fp16_selected_positions": None if sel is None else sorted(sel),
+            "evidence_token_positions": sorted(gold_pos),
+            "packed_context_bytes": res.packed_bytes, "budget_bytes": res.budget_bytes,
+            "fraction_of_fp16_bytes": res.packed_bytes / compute_uncompressed_fp16_bytes(L),
+            "shared_decode_cache_bytes_fp16": shared_bytes,
+            "total_live_cache_bytes": res.packed_bytes + shared_bytes,
+            "k_reconstruction_rel_error": res.recon_error_k, "v_reconstruction_rel_error": res.recon_error_v,
+            "context_prefill_s": prefill_s, "importance_scoring_s": scoring_s if name in (
+                "question_aware_fp16", "hybrid_fp16_int2") else 0.0,
+            "policy_apply_s": policy_s, "question_prefill_s": qprefill_s, "decode_s": decode_s,
+            "decode_tokens": len(tokens), "prefill_peak_alloc_mb": prefill_peak,
+            "decode_peak_alloc_mb": decode_peak, "extra": res.extra,
+        }
+        del cache, tf_cache
+    return results
+
+
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return float(np.mean(xs)) if xs else None
+
+
+def summarize(per_policy: Dict[str, List[Dict]]) -> Dict[str, Any]:
+    ref = per_policy["fp16_reference"]
+    ref_ok = [r["is_correct"] for r in ref]
+    summary, breakdown = {}, {}
+    for p, rows in per_policy.items():
+        summary[p] = {
+            "exact_match_accuracy": _mean([r["is_correct"] for r in rows]),
+            "accuracy_conditional_on_fp16_correct": _mean([r["is_correct"] for r, ok in zip(rows, ref_ok) if ok]),
+            "mean_reference_answer_nll": _mean([r["reference_answer_nll"] for r in rows]),
+            "mean_teacher_forced_kl": _mean([r["teacher_forced_mean_kl"] for r in rows]),
+            "mean_post_prefill_kl": _mean([r["post_prefill_kl"] for r in rows]),
+            "mean_retained_evidence": _mean([r["retained_evidence_fraction"] for r in rows]),
+            "mean_packed_mb": _mean([r["packed_context_bytes"] / 2**20 for r in rows]),
+            "max_bytes_over_budget": max(r["packed_context_bytes"] - r["budget_bytes"] for r in rows) if p != "fp16_reference" else None,
+            "mean_fraction_of_fp16_bytes": _mean([r["fraction_of_fp16_bytes"] for r in rows]),
+            "mean_k_recon_error": _mean([r["k_reconstruction_rel_error"] for r in rows]),
+            "mean_v_recon_error": _mean([r["v_reconstruction_rel_error"] for r in rows]),
+            "mean_scoring_s": _mean([r["importance_scoring_s"] for r in rows]),
+            "mean_policy_apply_s": _mean([r["policy_apply_s"] for r in rows]),
+            "mean_context_prefill_s": _mean([r["context_prefill_s"] for r in rows]),
+            "mean_decode_s": _mean([r["decode_s"] for r in rows]),
+            "mean_decode_peak_alloc_mb": _mean([r["decode_peak_alloc_mb"] for r in rows]),
+            "n": len(rows),
+        }
+        cells = defaultdict(list)
+        for r in rows:
+            for key in (f"len={r['target_tokens']}", f"pos={r['evidence_position']}", f"distr={r['distractors']}",
+                        f"cell={r['target_tokens']}/{r['evidence_position']}/{r['distractors']}"):
+                cells[key].append(r["is_correct"])
+        breakdown[p] = {k: {"accuracy": float(np.mean(v)), "n": len(v)} for k, v in sorted(cells.items())}
+
+    boot = {}
+    for p in POLICIES[1:]:
+        for base in ("fp16_reference", "question_aware_fp16", "channel_k_token_v_int4"):
+            if base == p:
+                continue
+            d = [float(a["is_correct"]) - float(b["is_correct"]) for a, b in zip(per_policy[p], per_policy[base])]
+            boot[f"{p}_minus_{base}_accuracy"] = paired_bootstrap(d)
+            d = [a["reference_answer_nll"] - b["reference_answer_nll"] for a, b in zip(per_policy[p], per_policy[base])]
+            boot[f"{p}_minus_{base}_ref_nll"] = paired_bootstrap(d)
+    return {"summary": summary, "breakdown": breakdown, "bootstrap": boot}
+
+
+def run_full_kv_evaluation(model, tokenizer, device: str = "cuda", max_cases: Optional[int] = None) -> Dict[str, Any]:
     prompts = load_retrieval_prompts()
     if max_cases is not None:
         prompts = prompts[:max_cases]
 
-    policies = [
-        "fp16_reference",
-        "sink_recent_fp16",
-        "question_aware_fp16",
-        "token_wise_int4",
-        "channel_k_token_v_int4",
-        "hybrid_fp16_int2",
-    ]
+    # C1 on one prompt per factorial cell before interpreting compressed variants.
+    seen, c1_records = set(), []
+    for r in prompts:
+        cell = (r["target_tokens"], r["position"], r["distractors"])
+        if cell not in seen:
+            seen.add(cell)
+            c1_records.append(r)
+    c1 = validate_fp16_reference(model, tokenizer, c1_records, device=device)
+    print(f"[C1] max |logit diff| full vs split = {c1['max_abs_logit_diff']:.4g}; "
+          f"argmax equal: {c1['all_argmax_equal']}; generation match rate: {c1['generation_match_rate']:.2f}")
 
-    print(f"\n{'='*80}")
-    print(f"PART C: EVALUATING PRETRAINED KV CACHE COMPRESSION ({len(prompts)} cases)")
-    print(f"{'='*80}\n")
+    per_policy: Dict[str, List[Dict]] = {p: [] for p in POLICIES}
+    for i, rec in enumerate(prompts):
+        if i % 10 == 0:
+            print(f"[Part C] prompt {i + 1}/{len(prompts)} ({rec['id']})", flush=True)
+        for p, row in evaluate_prompt(model, tokenizer, rec, device=device).items():
+            per_policy[p].append(row)
 
-    policy_results = {p: [] for p in policies}
-
-    for idx, prompt in enumerate(prompts):
-        if (idx + 1) % 10 == 0 or idx == 0:
-            print(f"Evaluating prompt {idx + 1:3d}/{len(prompts)} [Len: {prompt.get('target_tokens', 2048)} | Pos: {prompt.get('position', 'middle')} | Distr: {prompt.get('distractors', 0)}]")
-
-        # Evaluate reference first to collect FP16 logits and cache prefilled context
-        ref_res, precomputed = evaluate_kv_prompt_case(
-            model, tokenizer, prompt, "fp16_reference", device=device, return_precomputed=True
-        )
-        policy_results["fp16_reference"].append(ref_res)
-        ref_logits = ref_res["first_logits"].float()
-        ref_probs = F.softmax(ref_logits, dim=-1)
-
-        # Evaluate compressed policies reusing the prefilled context
-        for p in policies[1:]:
-            res = evaluate_kv_prompt_case(
-                model, tokenizer, prompt, p, device=device, precomputed_cache=precomputed
-            )
-            # Compute logit KL divergence from FP16 reference
-            comp_logits = res["first_logits"].float()
-            comp_log_probs = F.log_softmax(comp_logits, dim=-1)
-            kl = F.kl_div(comp_log_probs, ref_probs, reduction="sum").item()
-            res["logit_kl"] = kl
-            policy_results[p].append(res)
-
-    # Aggregate metrics per policy
-    summary = {}
-    ref_correct = [r["is_correct"] for r in policy_results["fp16_reference"]]
-
-    for p in policies:
-        cases = policy_results[p]
-        acc = np.mean([r["is_correct"] for r in cases])
-        nll = np.mean([r["answer_nll"] for r in cases])
-        retained = np.mean([r["retained_evidence_fraction"] for r in cases])
-        bytes_avg = np.mean([r["actual_packed_bytes"] for r in cases])
-        kl_avg = np.mean([r.get("logit_kl", 0.0) for r in cases])
-
-        # Conditional accuracy on FP16 reference correctness
-        corr_indices = [i for i, corr in enumerate(ref_correct) if corr]
-        cond_acc = np.mean([cases[i]["is_correct"] for i in corr_indices]) if corr_indices else 0.0
-
-        summary[p] = {
-            "exact_match_accuracy": float(acc),
-            "conditional_accuracy": float(cond_acc),
-            "mean_answer_nll": float(nll),
-            "mean_logit_kl": float(kl_avg),
-            "mean_retained_evidence": float(retained),
-            "mean_packed_mb": float(bytes_avg / (1024 * 1024)),
-        }
-        print(
-            f"[{p:<25}] Acc: {acc*100:5.1f}% (Cond: {cond_acc*100:5.1f}%) | "
-            f"NLL: {nll:5.2f} | KL: {kl_avg:5.2f} | Evidence: {retained*100:5.1f}% | MB: {bytes_avg/(1024*1024):5.1f}"
-        )
-
-    # Compute paired bootstrap confidence intervals against Question-Aware and KIVI
-    bootstrap_results = {}
-    for comp_p in ["sink_recent_fp16", "token_wise_int4", "channel_k_token_v_int4", "hybrid_fp16_int2"]:
-        diffs_acc = [
-            float(policy_results[comp_p][i]["is_correct"]) - float(policy_results["question_aware_fp16"][i]["is_correct"])
-            for i in range(len(prompts))
-        ]
-        diffs_nll = [
-            policy_results[comp_p][i]["answer_nll"] - policy_results["question_aware_fp16"][i]["answer_nll"]
-            for i in range(len(prompts))
-        ]
-        bootstrap_results[f"{comp_p}_vs_question_aware_acc"] = compute_paired_bootstrap_ci(diffs_acc)
-        bootstrap_results[f"{comp_p}_vs_question_aware_nll"] = compute_paired_bootstrap_ci(diffs_nll)
-
-    return {
-        "summary": summary,
-        "bootstrap": bootstrap_results,
-        "raw_cases": {p: [{k: v for k, v in r.items() if k != "first_logits"} for r in policy_results[p]] for p in policies},
+    out = summarize(per_policy)
+    for p, s in out["summary"].items():
+        print(f"[{p:<24}] acc {s['exact_match_accuracy']:.3f} | ref-NLL {s['mean_reference_answer_nll']:.3f} "
+              f"| TF-KL {s['mean_teacher_forced_kl']:.3f} | MB {s['mean_packed_mb']:.2f}")
+    out["c1_validation"] = c1
+    out["raw_cases"] = per_policy
+    out["config"] = {
+        "model_dtype": "float16", "attn_implementation": "sdpa", "max_new_tokens": MAX_NEW_TOKENS,
+        "answer_extractor": r"first \b\d{5}\b match", "retention_sharing": "shared across all layers and heads",
+        "importance": "question-suffix q_proj queries (hooked, RoPE-rotated) vs cached keys, FP32 softmax over "
+                      "context keys, mean over heads/query positions/upper-half layers, max-pool k=5",
+        "position_metadata": "1-bit-per-position mask, ceil(L/8) bytes, for question-aware and hybrid",
+        "budget": "M_4(L) of uniform INT4 channel-K/token-V, group 64, FP16 scale+offset, trailing L mod 64 FP16",
     }
+    return out

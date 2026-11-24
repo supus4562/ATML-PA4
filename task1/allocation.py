@@ -18,6 +18,7 @@ def solve_p3_sparsity_allocation(
     target_global_sparsity: float,
     min_sparsity: float = 0.10,
     max_sparsity: float = 0.85,
+    alpha: float = 0.15,
 ) -> Dict[str, float]:
     """Solve for layer-wise sparsities s_ell in [min_sparsity, max_sparsity] matching exact total zeros.
 
@@ -39,8 +40,11 @@ def solve_p3_sparsity_allocation(
     std_log_sens = math.sqrt(var_log_sens) if var_log_sens > 1e-6 else 1.0
     norm_sens = [(x - mean_log_sens) / std_log_sens for x in log_sens]
 
-    # Responsiveness scaling alpha: determines how much sensitive layers diverge from insensitive layers
-    alpha = 0.15
+    # `alpha` (responsiveness) is selected on the C4 development split by the runner.
+    def _zeros(name: str, s_val: float) -> int:
+        # Must match the pruner exactly: round(s * n_in) weights zeroed in every output row.
+        n_out, n_in = eligible_modules[name].weight.shape
+        return n_out * int(round(s_val * n_in))
 
     # Bisection search over offset lambda to match exact global zero count
     low, high = -1.0, 1.0
@@ -57,11 +61,10 @@ def solve_p3_sparsity_allocation(
             clamped_s = min(max_sparsity, max(min_sparsity, raw_s))
             allocations[name] = clamped_s
 
-            numel = layer_param_counts[name]
-            current_zeros += int(round(clamped_s * numel))
+            current_zeros += _zeros(name, clamped_s)
 
         best_allocations = allocations
-        if abs(current_zeros - target_total_zeros) <= 1:
+        if current_zeros == target_total_zeros:
             break
         elif current_zeros < target_total_zeros:
             low = mid
@@ -69,29 +72,41 @@ def solve_p3_sparsity_allocation(
             high = mid
 
     # Final fine-tuning to guarantee EXACT integer zero count
-    current_zeros = sum(int(round(best_allocations[name] * layer_param_counts[name])) for name in layer_names)
+    # Snap each allocation to an integer per-row prune count so rounding is unambiguous.
+    for name in layer_names:
+        n_in = eligible_modules[name].weight.shape[1]
+        best_allocations[name] = int(round(best_allocations[name] * n_in)) / n_in
+    current_zeros = sum(_zeros(name, best_allocations[name]) for name in layer_names)
     diff = target_total_zeros - current_zeros
 
-    if diff != 0:
-        # Fine-tune by adjusting layers whose column step (n_out) reduces |diff| without oscillating
-        sorted_layers = sorted(layer_names, key=lambda n: sensitivity_scores.get(n, 1.0))
-        for target_name in sorted_layers:
+    # Greedy integer fine-tuning: move one weight per row (n_out zeros) in the least
+    # (to add zeros) or most (to remove zeros) sensitive layers until no step fits.
+    sorted_layers = sorted(layer_names, key=lambda n: sensitivity_scores.get(n, 1.0))
+    progress = True
+    while diff != 0 and progress:
+        progress = False
+        order = sorted_layers if diff > 0 else list(reversed(sorted_layers))
+        for target_name in order:
             n_out, n_in = eligible_modules[target_name].weight.shape
-            step_zeros = n_out
-            if diff >= step_zeros and best_allocations[target_name] + (1.0 / n_in) <= max_sparsity:
-                best_allocations[target_name] += 1.0 / n_in
-                diff -= step_zeros
-            elif diff <= -step_zeros and best_allocations[target_name] - (1.0 / n_in) >= min_sparsity:
-                best_allocations[target_name] -= 1.0 / n_in
-                diff += step_zeros
+            k_cur = int(round(best_allocations[target_name] * n_in))
+            if diff >= n_out and (k_cur + 1) / n_in <= max_sparsity:
+                best_allocations[target_name] = (k_cur + 1) / n_in
+                diff -= n_out
+                progress = True
+            elif diff <= -n_out and (k_cur - 1) / n_in >= min_sparsity:
+                best_allocations[target_name] = (k_cur - 1) / n_in
+                diff += n_out
+                progress = True
             if diff == 0:
                 break
 
-    achieved_global_sparsity = sum(
-        best_allocations[n] * layer_param_counts[n] for n in layer_names
-    ) / total_eligible_params
+    achieved_global_sparsity = sum(_zeros(n, best_allocations[n]) for n in layer_names) / total_eligible_params
+    residual = target_total_zeros - sum(_zeros(n, best_allocations[n]) for n in layer_names)
 
-    print(f"[P3 Allocation] Target: {target_global_sparsity:.2%}, Achieved: {achieved_global_sparsity:.4%}")
+    print(
+        f"[P3 Allocation] Target: {target_global_sparsity:.2%}, Achieved: {achieved_global_sparsity:.6%} "
+        f"(residual {residual} weights; integer-row rounding granularity)"
+    )
     return best_allocations
 
 
@@ -102,6 +117,7 @@ def solve_q3_bit_allocation(
     target_packed_bytes: int,
     allowed_bits: tuple[int, ...] = (2, 3, 4, 8),
     group_size: int = 128,
+    awq_channel_scales: bool = True,
 ) -> Dict[str, int]:
     """Solve for layer-wise bit widths b_ell in {2, 3, 4, 8} strictly within target_packed_bytes.
 
@@ -124,6 +140,7 @@ def solve_q3_bit_allocation(
         eligible_projections=eligible_projections,
         bit_allocations=allocations,
         group_size=group_size,
+        awq_channel_scales=awq_channel_scales,
     )
     current_bytes = current_storage["total_bytes"]
 
@@ -177,6 +194,7 @@ def solve_q3_bit_allocation(
         eligible_projections=eligible_projections,
         bit_allocations=allocations,
         group_size=group_size,
+        awq_channel_scales=awq_channel_scales,
     )
     print(
         f"[Q3 Allocation] Target Budget: {target_packed_bytes:,} bytes, "

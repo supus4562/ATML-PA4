@@ -102,3 +102,27 @@ KV_RECENT_TOKENS = 64
 KV_BOOTSTRAP_RESAMPLES = 2000
 KV_BENCHMARK_REPETITIONS = 10
 KV_BENCHMARK_BATCHES = [1, 8]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Part B3: Controlled intervention (stated BEFORE the rerun's evaluation)
+# ──────────────────────────────────────────────────────────────────────────────
+INTERVENTION_SPEC = {
+    "name": "Decay-gated linear attention (DGLA)",
+    "comparator": "causal ELU+1 linear attention, K=16, mixed regime",
+    "change": "input-dependent per-head forgetting gate gamma_t in (0.5, 1): "
+              "S_t = gamma_t S_{t-1} + phi(k_t) v_t^T, z_t = gamma_t z_{t-1} + phi(k_t)",
+    "motivation": "linear attention accumulates every key into one fixed-size state, so filler tokens "
+                  "and earlier pairs interfere with recall; a learned gate can down-weight filler writes",
+    "prediction": "DGLA will match or exceed linear attention on near queries and will not exceed it on "
+                  "far queries (distance >= 128), because any decay gamma < 1 attenuates old pairs "
+                  "geometrically (0.5^128 at the gate's lower bound).",
+    "extra_trainable_params": "gate_proj: 128*4 weights + 4 biases = 516 per layer, 1,032 total "
+                              "(well under 5% of the baseline)",
+    "persistent_state_per_layer": "identical to the comparator: per head S (32x32) + z (32), FP32 = "
+                                  "4 * (1024 + 32) * 4 heads = 16,896 bytes; the gate adds no stored state",
+    "attended_positions": "all preceding positions via the recurrent state (no pairwise selection)",
+    "development_selection_rule": "no hyperparameter search; gate range fixed a priori; final 4,500-update "
+                                  "checkpoint reported; development-stream accuracy logged at the "
+                                  "prescribed checkpoints only for learning curves",
+    "seeds": [6304, 6305, 6306],
+}

@@ -153,12 +153,12 @@ def _run_task2_in_container(
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from task2.config import KV_MODEL_NAME
         from task2.eval_context_benchmark import run_context_benchmarks
-        print(f"Loading '{KV_MODEL_NAME}' in bfloat16 on cuda...")
+        print(f"Loading '{KV_MODEL_NAME}' in FP16 (SDPA) on cuda...")
         tokenizer = AutoTokenizer.from_pretrained(KV_MODEL_NAME, use_fast=True)
         model = AutoModelForCausalLM.from_pretrained(
             KV_MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="eager",
+            torch_dtype=torch.float16,
+            attn_implementation="sdpa",
             device_map="cuda",
         )
         model.eval()

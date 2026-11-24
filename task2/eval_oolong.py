@@ -25,6 +25,8 @@ from task2.config import (
     REPO_ROOT,
     KV_MODEL_NAME,
 )
+from task2.kv_core import build_cache, policy_tail_state, prefill_question, question_importance
+from task2.kv_policies import apply_policy
 from task2.kv_policies import (
     apply_policy_sink_recent,
     apply_policy_question_aware,
@@ -150,51 +152,21 @@ def evaluate_oolong_case(
         out_ctx = model(**enc_context, use_cache=True)
         pkv = out_ctx.past_key_values
 
-    k_list = [pkv[i][0].clone() for i in range(len(pkv))]
-    v_list = [pkv[i][1].clone() for i in range(len(pkv))]
+    n_layers = len(model.model.layers)
+    k_list = [pkv.layers[i].keys.clone() for i in range(n_layers)]
+    v_list = [pkv.layers[i].values.clone() for i in range(n_layers)]
 
-    # Get question query projection for question-aware policies
-    with torch.no_grad():
-        emb = model.model.embed_tokens(enc_question.input_ids)
-        H_q = model.config.num_attention_heads
-        d_h = model.config.hidden_size // H_q
-        q_question = model.model.layers[0].self_attn.q_proj(emb).view(1, L_q, H_q, d_h).transpose(1, 2)
-
-    # Apply policy
-    if policy_name == "fp16_reference":
-        k_comp, v_comp, keep_indices = k_list, v_list, torch.arange(L_ctx, device=device)
-    elif policy_name == "sink_recent_fp16":
-        k_comp, v_comp, keep_indices, _ = apply_policy_sink_recent(k_list, v_list)
-    elif policy_name == "question_aware_fp16":
-        k_comp, v_comp, keep_indices, _ = apply_policy_question_aware(k_list, v_list, q_question)
-    elif policy_name == "token_wise_int4":
-        k_comp, v_comp, keep_indices, _ = apply_policy_token_wise_int4(k_list, v_list)
-    elif policy_name == "channel_k_token_v_int4":
-        k_comp, v_comp, keep_indices, _ = apply_policy_channel_k_token_v_int4(k_list, v_list)
-    elif policy_name == "hybrid_fp16_int2":
-        k_comp, v_comp, keep_indices, _ = apply_policy_hybrid(k_list, v_list, q_question)
-    else:
-        raise ValueError(f"Unknown policy: {policy_name}")
-
-    # Build cache and prefill question suffix
-    cache = DynamicCache()
-    for layer_idx in range(len(k_comp)):
-        cache.update(k_comp[layer_idx], v_comp[layer_idx], layer_idx)
-
-    question_pos_ids = torch.arange(L_ctx, L_ctx + L_q, device=device).unsqueeze(0)
-
-    with torch.no_grad():
-        out_q = model(
-            input_ids=enc_question.input_ids,
-            position_ids=question_pos_ids,
-            past_key_values=cache,
-            use_cache=True,
-        )
+    q_importance = None
+    if policy_name in ("question_aware_fp16", "hybrid_fp16_int2"):
+        q_importance, _ = question_importance(model, k_list, v_list, enc_question.input_ids, L_ctx)
+    res = apply_policy(policy_name, k_list, v_list, q_importance)
+    cache = build_cache(res.k, res.v)
+    first = prefill_question(model, cache, enc_question.input_ids, L_ctx, policy_tail_state(res))
 
     # Greedy decode for up to 32 tokens
-    curr_input = torch.argmax(out_q.logits[:, -1, :], dim=-1, keepdim=True)
+    curr_input = torch.argmax(first, dim=-1, keepdim=True)
     generated_tokens = [curr_input.item()]
-    curr_cache = out_q.past_key_values
+    curr_cache = cache
     curr_pos = L_ctx + L_q
 
     with torch.no_grad():

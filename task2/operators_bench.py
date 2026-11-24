@@ -24,6 +24,7 @@ from task2.operators import (
     tiled_causal_attention,
     sdpa_attention,
     get_sdpa_backend,
+    probe_sdpa_backend,
 )
 
 
@@ -114,6 +115,9 @@ def run_operator_grid(
                 # Use SDPA FP32 as reference for L=8192 where dense baseline is infeasible
                 ref_out = sdpa_attention(q_ref, k_ref, v_ref)[0]
 
+            sdpa_probe = probe_sdpa_backend(
+                q_ref.detach().to(dtype), k_ref.detach().to(dtype), v_ref.detach().to(dtype)
+            )
             # Now benchmark each operator
             for op_name in ["dense", "tiled", "sdpa"]:
                 if op_name == "dense" and not is_dense_feasible:
@@ -121,11 +125,11 @@ def run_operator_grid(
                         "dtype": dtype_str,
                         "length": L,
                         "operator": "dense",
-                        "output_err_vs_fp32": "OOM (Infeasible)",
-                        "grad_err_vs_fp32": "OOM (Infeasible)",
-                        "fwd_latency_ms": "OOM",
-                        "fwd_bwd_latency_ms": "OOM",
-                        "peak_vram_mb": ">22GB",
+                        "output_err_vs_fp32": "SKIPPED (not attempted: dense L x L autograd judged infeasible)",
+                        "grad_err_vs_fp32": "SKIPPED (not attempted)",
+                        "fwd_latency_ms": "SKIPPED",
+                        "fwd_bwd_latency_ms": "SKIPPED",
+                        "peak_vram_mb": "SKIPPED",
                         "sdpa_backend": "N/A",
                     })
                     print(f"[{dtype_str.upper()} L={L:<5} dense] OOM (Dense matrix infeasible at L={L})")
@@ -212,7 +216,8 @@ def run_operator_grid(
                         "fwd_latency_ms": fwd_ms,
                         "fwd_bwd_latency_ms": bwd_ms,
                         "peak_vram_mb": peak_vram_mb,
-                        "sdpa_backend": active_backend if op_name == "sdpa" else "N/A",
+                        "sdpa_backend": sdpa_probe["dispatched"] if op_name == "sdpa" else "N/A",
+                        "sdpa_supported_backends": sdpa_probe["supported"] if op_name == "sdpa" else None,
                     }
                     grid_results.append(record)
                     print(
@@ -231,8 +236,9 @@ def run_operator_grid(
                         "grad_err_vs_fp32": "OOM",
                         "fwd_latency_ms": "OOM",
                         "fwd_bwd_latency_ms": "OOM",
-                        "peak_vram_mb": ">22GB",
-                        "sdpa_backend": active_backend if op_name == "sdpa" else "N/A",
+                        "peak_vram_mb": f"OOM (device total {torch.cuda.get_device_properties(0).total_memory / 2**20:.0f} MB)",
+                        "sdpa_backend": sdpa_probe["dispatched"] if op_name == "sdpa" else "N/A",
+                        "sdpa_supported_backends": sdpa_probe["supported"] if op_name == "sdpa" else None,
                     })
                     print(f"[{dtype_str.upper()} L={L:<5} {op_name:<5}] OutOfMemoryError (OOM recorded)")
 

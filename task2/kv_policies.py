@@ -1,286 +1,250 @@
 """task2/kv_policies.py — The 5 matched-budget KV cache compression and eviction policies.
+
+Every policy returns a `PolicyResult` with:
+  k / v              per-layer tensors placed into the cache (dequantized where quantized)
+  keep_indices       original positions physically present in the cache (sorted)
+  fp16_selected      original positions held in FP16 by a selection rule (eviction / hybrid);
+                     used for the retained-evidence metric
+  packed_bytes       serialized bytes of the pre-question context cache, including payload,
+                     scale/offset metadata, FP16 residual and any position mask
+  quantized_upto     number of leading cache slots already stored at low precision (complete
+                     64-token groups); later tokens form the FP16 tail that is re-grouped as the
+                     cache grows (see kv_core.requantize_tail)
+  recon_error_k/v    relative Frobenius reconstruction error of K and V (quantized policies)
+
+Retention is SHARED across all layers and heads (one global set of positions), so position
+metadata is stored once: a 1-bit-per-position mask of ceil(L/8) bytes.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
 import torch
 import torch.nn.functional as F
 
-from task2.config import (
-    KV_SINK_TOKENS,
-    KV_RECENT_TOKENS,
-    KV_GROUP_SIZE,
-)
+from task2.config import KV_SINK_TOKENS, KV_RECENT_TOKENS, KV_GROUP_SIZE
 from task2.kv_cache_models import (
     compute_matched_int4_bytes,
     compute_fp16_retained_token_count,
     compute_hybrid_fp16_token_count,
+    position_mask_bytes,
+    bytes_per_fp16_token,
 )
-from task2.kv_quantizers import (
-    quantize_token_wise_kv,
-    quantize_channel_k_token_v,
-    quantize_affine_group,
-)
+from task2.kv_quantizers import quantize_affine_group
 
 
-def compute_question_importance_scores(
-    k_cache: List[torch.Tensor],
-    q_question: torch.Tensor,
-) -> torch.Tensor:
-    """Compute per-token importance scores using question-suffix attention weights.
-    
-    Args:
-        k_cache: List of key tensors per layer, each (B, H_kv, L, d_h)
-        q_question: Query tensor of the question suffix (B, H_q, L_q, d_h) or precomputed 1D scores (L,)
-        
-    Returns:
-        importance: (L,) importance score per prompt position with 1D max pooling
+@dataclass
+class PolicyResult:
+    k: List[torch.Tensor]
+    v: List[torch.Tensor]
+    keep_indices: torch.Tensor
+    fp16_selected: Optional[torch.Tensor]
+    packed_bytes: int
+    budget_bytes: int
+    quantized_upto: int = 0
+    quant_layout: Optional[str] = None  # "token_wise" | "channel_k_token_v" | None
+    quant_bits: Optional[int] = None
+    recon_error_k: Optional[float] = None
+    recon_error_v: Optional[float] = None
+    extra: Dict = field(default_factory=dict)
+
+
+def pool_importance(scores: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    """1D max-pooling of per-position importance (SnapKV-style clustering)."""
+    s = scores.float().view(1, 1, -1)
+    return F.max_pool1d(s, kernel_size=kernel_size, stride=1, padding=kernel_size // 2).view(-1)
+
+
+def _select_middle(importance: torch.Tensor, L: int, n_total: int) -> torch.Tensor:
+    """8 sink + 64 recent safeguards, remaining budget filled with top-importance positions."""
+    device = importance.device
+    if n_total < min(L, KV_SINK_TOKENS + KV_RECENT_TOKENS):
+        raise ValueError(f"Budget allows {n_total} positions, fewer than the 8 sink + 64 recent safeguards (L={L})")
+    sink = min(KV_SINK_TOKENS, L)
+    recent = min(KV_RECENT_TOKENS, L - sink)
+    sink_idx = torch.arange(0, sink, device=device)
+    recent_idx = torch.arange(L - recent, L, device=device)
+    n_mid = max(0, n_total - sink - recent)
+    mid_lo, mid_hi = sink, L - recent
+    if n_mid > 0 and mid_hi > mid_lo:
+        pooled = pool_importance(importance[:L])
+        top = torch.topk(pooled[mid_lo:mid_hi], k=min(n_mid, mid_hi - mid_lo)).indices + mid_lo
+    else:
+        top = torch.empty(0, dtype=torch.long, device=device)
+    return torch.sort(torch.cat([sink_idx, top, recent_idx]).unique()).values
+
+
+def _rel_err(a: List[torch.Tensor], b: List[torch.Tensor]) -> float:
+    num = sum(float(((x.float() - y.float()) ** 2).sum()) for x, y in zip(a, b))
+    den = sum(float((x.float() ** 2).sum()) for x in a)
+    return math.sqrt(num / max(den, 1e-30))
+
+
+def quantize_kv_block(k: torch.Tensor, v: torch.Tensor, layout: str, bits: int):
+    """Quantize a block of complete 64-token groups (shapes (B, H, T, d), T % 64 == 0).
+
+    channel_k_token_v: K grouped along tokens per channel, V grouped along channels per token.
+    token_wise:        K and V both grouped along channels per token.
+    Returns dequantized K, V and serialized bytes.
     """
-    device = k_cache[0].device
-    L = k_cache[0].shape[2]
-
-    # If already a 1D importance score vector (e.g. from true layer attention)
-    if q_question.ndim == 1:
-        scores = q_question.to(device).float()
-        if len(scores) != L:
-            scores = F.interpolate(scores.view(1, 1, -1), size=L, mode="nearest").squeeze()
-        # 1D max pooling with kernel size 5 to capture neighboring tokens (entity/code clusters)
-        pooled = F.max_pool1d(scores.view(1, 1, -1), kernel_size=5, stride=1, padding=2).squeeze()
-        return pooled
-
-    total_scores = torch.zeros(L, device=device, dtype=torch.float32)
-
-    # Sample top/middle/bottom layers or all layers to accumulate attention
-    step = max(1, len(k_cache) // 4)
-    sampled_layers = list(range(0, len(k_cache), step))
-
-    with torch.no_grad():
-        for layer_idx in sampled_layers:
-            k = k_cache[layer_idx].float()  # (B, H_kv, L, d_h)
-            B, H_kv, _, d_h = k.shape
-            # Repeat KV heads to match query heads if GQA
-            H_q = q_question.shape[1]
-            rep = H_q // H_kv
-            if rep > 1:
-                k = k.repeat_interleave(rep, dim=1)  # (B, H_q, L, d_h)
-
-            # Dot-product between question queries and prompt keys: (B, H_q, L_q, L)
-            scores = torch.matmul(q_question.float(), k.transpose(-2, -1)) / math.sqrt(d_h)
-            attn_probs = torch.softmax(scores, dim=-1)  # (B, H_q, L_q, L)
-
-            # Sum across batch, heads, and question length
-            layer_imp = attn_probs.sum(dim=(0, 1, 2))  # (L,)
-            total_scores += layer_imp
-
-    # Apply 1D max pooling of kernel size 5 to cluster tokens
-    pooled_total = F.max_pool1d(total_scores.view(1, 1, -1), kernel_size=5, stride=1, padding=2).squeeze()
-    return pooled_total
+    if layout == "channel_k_token_v":
+        k_deq, _, _, kb = quantize_affine_group(k, bits=bits, group_size=KV_GROUP_SIZE, dim=2)
+    elif layout == "token_wise":
+        k_deq, _, _, kb = quantize_affine_group(k, bits=bits, group_size=KV_GROUP_SIZE, dim=-1)
+    else:
+        raise ValueError(layout)
+    v_deq, _, _, vb = quantize_affine_group(v, bits=bits, group_size=KV_GROUP_SIZE, dim=-1)
+    return k_deq, v_deq, kb + vb
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Policy 1: Sink + Recent FP16 Eviction
 # ──────────────────────────────────────────────────────────────────────────────
 
-def apply_policy_sink_recent(
-    k_list: List[torch.Tensor],
-    v_list: List[torch.Tensor],
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-    """Policy 1: Retains largest legal number of FP16 positions: 8 sink + 64 recent + fill budget with recent."""
+def apply_policy_sink_recent(k_list: List[torch.Tensor], v_list: List[torch.Tensor]) -> PolicyResult:
+    """8 sink + 64 recent, remainder filled with the most recent positions.
+
+    The retained set is two contiguous ranges, so no per-position mask is stored.
+    """
     L = k_list[0].shape[2]
-    budget_bytes = compute_matched_int4_bytes(L, b=4)
-    n_retain = compute_fp16_retained_token_count(L, b=4)
-
-    sink_count = min(KV_SINK_TOKENS, L)
-    recent_count = min(KV_RECENT_TOKENS, L - sink_count)
-    rem_budget = max(0, n_retain - (sink_count + recent_count))
-
-    # Selected indices: sink tokens (0..sink_count-1) and most recent (L - recent_count - rem_budget .. L-1)
-    sink_idx = torch.arange(0, sink_count, device=k_list[0].device)
-    tail_start = max(sink_count, L - (recent_count + rem_budget))
-    tail_idx = torch.arange(tail_start, L, device=k_list[0].device)
-    keep_indices = torch.cat([sink_idx, tail_idx]).unique()
-
-    k_out = [k[:, :, keep_indices, :] for k in k_list]
-    v_out = [v[:, :, keep_indices, :] for v in v_list]
-    actual_bytes = len(keep_indices) * (4 * len(k_list) * k_list[0].shape[1] * k_list[0].shape[3])
-
-    return k_out, v_out, keep_indices, actual_bytes
+    budget = compute_matched_int4_bytes(L, b=4)
+    n_retain = min(L, compute_fp16_retained_token_count(L, b=4, metadata_bytes=0))
+    sink = min(KV_SINK_TOKENS, L)
+    tail_start = max(sink, L - (n_retain - sink))
+    device = k_list[0].device
+    keep = torch.cat([torch.arange(0, sink, device=device), torch.arange(tail_start, L, device=device)]).unique()
+    packed = len(keep) * bytes_per_fp16_token()
+    assert packed <= budget
+    return PolicyResult(
+        k=[k[:, :, keep, :] for k in k_list], v=[v[:, :, keep, :] for v in v_list],
+        keep_indices=keep, fp16_selected=keep, packed_bytes=packed, budget_bytes=budget,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Policy 2: Question-Aware FP16 Eviction (SnapKV)
+# Policy 2: Question-Aware FP16 Eviction (simplified SnapKV-inspired, shared across heads/layers)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def apply_policy_question_aware(
-    k_list: List[torch.Tensor],
-    v_list: List[torch.Tensor],
-    q_question: torch.Tensor,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-    """Policy 2: 8 sink + 64 recent + top question-aware importance positions up to matched budget."""
+    k_list: List[torch.Tensor], v_list: List[torch.Tensor], importance: torch.Tensor
+) -> PolicyResult:
     L = k_list[0].shape[2]
-    n_retain = compute_fp16_retained_token_count(L, b=4)
-
-    sink_count = min(KV_SINK_TOKENS, L)
-    recent_count = min(KV_RECENT_TOKENS, L - sink_count)
-    num_middle_select = max(0, n_retain - (sink_count + recent_count))
-
-    # Mandatory safeguard indices
-    sink_idx = torch.arange(0, sink_count, device=k_list[0].device)
-    recent_idx = torch.arange(L - recent_count, L, device=k_list[0].device)
-
-    # Rank middle candidate positions
-    middle_start = sink_count
-    middle_end = max(sink_count, L - recent_count)
-    
-    if num_middle_select > 0 and middle_end > middle_start:
-        importance = compute_question_importance_scores(k_list, q_question)
-        middle_scores = importance[middle_start:middle_end]
-        k_top = min(num_middle_select, len(middle_scores))
-        _, top_rel_idx = torch.topk(middle_scores, k=k_top)
-        middle_idx = middle_start + top_rel_idx
-    else:
-        middle_idx = torch.empty(0, dtype=torch.long, device=k_list[0].device)
-
-    keep_indices = torch.cat([sink_idx, middle_idx, recent_idx]).unique()
-    keep_indices, _ = torch.sort(keep_indices)  # Maintain chronological order
-
-    k_out = [k[:, :, keep_indices, :] for k in k_list]
-    v_out = [v[:, :, keep_indices, :] for v in v_list]
-    actual_bytes = len(keep_indices) * (4 * len(k_list) * k_list[0].shape[1] * k_list[0].shape[3])
-
-    return k_out, v_out, keep_indices, actual_bytes
+    budget = compute_matched_int4_bytes(L, b=4)
+    n_retain = min(L, compute_fp16_retained_token_count(L, b=4, metadata_bytes=position_mask_bytes(L)))
+    keep = _select_middle(importance, L, n_retain)
+    packed = len(keep) * bytes_per_fp16_token() + position_mask_bytes(L)
+    assert packed <= budget
+    return PolicyResult(
+        k=[k[:, :, keep, :] for k in k_list], v=[v[:, :, keep, :] for v in v_list],
+        keep_indices=keep, fp16_selected=keep, packed_bytes=packed, budget_bytes=budget,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Policy 3: Token-wise INT4 Quantization
+# Policies 3 & 4: uniform INT4 quantization, two layouts, identical trailing-FP16 rule
 # ──────────────────────────────────────────────────────────────────────────────
 
-def apply_policy_token_wise_int4(
-    k_list: List[torch.Tensor],
-    v_list: List[torch.Tensor],
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-    """Policy 3: Group-64 INT4 quantization along hidden dimension for both K and V."""
+def _apply_uniform_quant(k_list, v_list, layout: str, bits: int = 4) -> PolicyResult:
     L = k_list[0].shape[2]
-    k_out = []
-    v_out = []
-    total_bytes = 0
-
+    full = (L // KV_GROUP_SIZE) * KV_GROUP_SIZE
+    k_out, v_out, total = [], [], 0
     for k, v in zip(k_list, v_list):
-        k_deq, v_deq, layer_bytes = quantize_token_wise_kv(k, v, bits=4, group_size=KV_GROUP_SIZE)
-        k_out.append(k_deq)
-        v_out.append(v_deq)
-        total_bytes += layer_bytes
+        k_new, v_new = k.clone(), v.clone()
+        if full > 0:
+            kq, vq, b = quantize_kv_block(k[:, :, :full], v[:, :, :full], layout, bits)
+            k_new[:, :, :full], v_new[:, :, :full] = kq, vq
+            total += b
+        k_out.append(k_new)
+        v_out.append(v_new)
+    # FP16 trailing residual r = L mod 64 for both K and V
+    total += (L - full) * bytes_per_fp16_token()
+    budget = compute_matched_int4_bytes(L, b=4)
+    return PolicyResult(
+        k=k_out, v=v_out, keep_indices=torch.arange(L, device=k_list[0].device), fp16_selected=None,
+        packed_bytes=total, budget_bytes=budget, quantized_upto=full, quant_layout=layout, quant_bits=bits,
+        recon_error_k=_rel_err(k_list, k_out), recon_error_v=_rel_err(v_list, v_out),
+    )
 
-    keep_indices = torch.arange(L, device=k_list[0].device)
-    return k_out, v_out, keep_indices, total_bytes
+
+def apply_policy_token_wise_int4(k_list, v_list) -> PolicyResult:
+    return _apply_uniform_quant(k_list, v_list, "token_wise", 4)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Policy 4: Channel-wise-K / Token-wise-V INT4 Quantization (KIVI)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def apply_policy_channel_k_token_v_int4(
-    k_list: List[torch.Tensor],
-    v_list: List[torch.Tensor],
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-    """Policy 4: Group-64 INT4 along tokens for K, and along hidden channels for V,
-    with 8 sink tokens and 64 recent streaming buffer tokens preserved in FP16 (KIVI specification).
-    """
-    L = k_list[0].shape[2]
-    device = k_list[0].device
-    k_out = []
-    v_out = []
-    total_bytes = 0
-
-    sink_count = min(KV_SINK_TOKENS, L)
-    recent_count = min(KV_RECENT_TOKENS, max(0, L - sink_count))
-    mid_start = sink_count
-    mid_end = max(sink_count, L - recent_count)
-
-    for k, v in zip(k_list, v_list):
-        k_layer = k.clone()
-        v_layer = v.clone()
-        layer_bytes = 0
-
-        # Account for FP16 sink + recent streaming buffer
-        num_fp16 = sink_count + recent_count
-        layer_bytes += num_fp16 * (k.shape[1] * k.shape[3] * 4)
-
-        if mid_end > mid_start:
-            k_mid = k[:, :, mid_start:mid_end, :]
-            v_mid = v[:, :, mid_start:mid_end, :]
-            k_mid_deq, v_mid_deq, mid_bytes = quantize_channel_k_token_v(k_mid, v_mid, bits=4, group_size=KV_GROUP_SIZE)
-            k_layer[:, :, mid_start:mid_end, :] = k_mid_deq
-            v_layer[:, :, mid_start:mid_end, :] = v_mid_deq
-            layer_bytes += mid_bytes
-
-        k_out.append(k_layer)
-        v_out.append(v_layer)
-        total_bytes += layer_bytes
-
-    keep_indices = torch.arange(L, device=device)
-    return k_out, v_out, keep_indices, total_bytes
+def apply_policy_channel_k_token_v_int4(k_list, v_list) -> PolicyResult:
+    """The reference: its packed bytes define the matched budget M_4(L) exactly."""
+    res = _apply_uniform_quant(k_list, v_list, "channel_k_token_v", 4)
+    assert res.packed_bytes == res.budget_bytes, (res.packed_bytes, res.budget_bytes)
+    return res
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Policy 5: Hybrid Precision & Token Selection (FP16 + INT2)
+# Policy 5: Hybrid — FP16 selection + channel-K / token-V INT2 for the rest
 # ──────────────────────────────────────────────────────────────────────────────
 
 def apply_policy_hybrid(
-    k_list: List[torch.Tensor],
-    v_list: List[torch.Tensor],
-    q_question: torch.Tensor,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-    """Policy 5: Retains 8 sink + 64 recent + top question-aware in FP16; compresses remainder to INT2."""
+    k_list: List[torch.Tensor], v_list: List[torch.Tensor], importance: torch.Tensor
+) -> PolicyResult:
+    """8 sink + 64 recent + top question-aware positions in FP16; remaining positions in
+    channel-wise-K / token-wise-V INT2. INT2 positions always form complete 64-token groups
+    (the low-precision set is gathered in chronological order and grouped along that order).
+    """
     L = k_list[0].shape[2]
-    n_fp16, n_int2 = compute_hybrid_fp16_token_count(L, group_size=KV_GROUP_SIZE)
+    budget = compute_matched_int4_bytes(L, b=4)
+    n_fp16, n_int2 = compute_hybrid_fp16_token_count(L)
+    fp16_idx = _select_middle(importance, L, n_fp16)
+    mask = torch.zeros(L, dtype=torch.bool, device=fp16_idx.device)
+    mask[fp16_idx] = True
+    int2_idx = torch.arange(L, device=fp16_idx.device)[~mask]
+    assert len(int2_idx) % KV_GROUP_SIZE == 0, len(int2_idx)
 
-    sink_count = min(KV_SINK_TOKENS, L)
-    recent_count = min(KV_RECENT_TOKENS, L - sink_count)
-    num_middle_select = max(0, n_fp16 - (sink_count + recent_count))
-
-    sink_idx = torch.arange(0, sink_count, device=k_list[0].device)
-    recent_idx = torch.arange(L - recent_count, L, device=k_list[0].device)
-    middle_start = sink_count
-    middle_end = max(sink_count, L - recent_count)
-
-    if num_middle_select > 0 and middle_end > middle_start:
-        importance = compute_question_importance_scores(k_list, q_question)
-        middle_scores = importance[middle_start:middle_end]
-        k_top = min(num_middle_select, len(middle_scores))
-        _, top_rel_idx = torch.topk(middle_scores, k=k_top)
-        middle_fp16_idx = middle_start + top_rel_idx
-    else:
-        middle_fp16_idx = torch.empty(0, dtype=torch.long, device=k_list[0].device)
-
-    fp16_indices = torch.cat([sink_idx, middle_fp16_idx, recent_idx]).unique()
-    fp16_mask = torch.zeros(L, dtype=torch.bool, device=k_list[0].device)
-    fp16_mask[fp16_indices] = True
-    int2_indices = torch.arange(L, device=k_list[0].device)[~fp16_mask]
-
-    # Quantize INT2 tokens (Channel-K / Token-V)
-    k_out = []
-    v_out = []
-    total_bytes = 0
-    bytes_per_fp16_token = 4 * len(k_list) * k_list[0].shape[1] * k_list[0].shape[3]
-    total_bytes += len(fp16_indices) * bytes_per_fp16_token
-
+    k_out, v_out, total = [], [], 0
     for k, v in zip(k_list, v_list):
-        k_new = k.clone()
-        v_new = v.clone()
-
-        if len(int2_indices) > 0:
-            k_int2 = k[:, :, int2_indices, :]
-            v_int2 = v[:, :, int2_indices, :]
-            k_deq, v_deq, layer_int2_bytes = quantize_token_wise_kv(k_int2, v_int2, bits=2, group_size=KV_GROUP_SIZE)
-            k_new[:, :, int2_indices, :] = k_deq
-            v_new[:, :, int2_indices, :] = v_deq
-            total_bytes += layer_int2_bytes
-
+        k_new, v_new = k.clone(), v.clone()
+        if len(int2_idx) > 0:
+            kq, vq, b = quantize_kv_block(k[:, :, int2_idx], v[:, :, int2_idx], "channel_k_token_v", 2)
+            k_new[:, :, int2_idx], v_new[:, :, int2_idx] = kq, vq
+            total += b
         k_out.append(k_new)
         v_out.append(v_new)
+    total += len(fp16_idx) * bytes_per_fp16_token() + position_mask_bytes(L)
+    assert total <= budget, (total, budget)
+    return PolicyResult(
+        k=k_out, v=v_out, keep_indices=torch.arange(L, device=fp16_idx.device), fp16_selected=fp16_idx,
+        packed_bytes=total, budget_bytes=budget, quantized_upto=0,  # positions are interleaved: no tail regrouping
+        quant_layout=None, quant_bits=2,
+        recon_error_k=_rel_err(k_list, k_out), recon_error_v=_rel_err(v_list, v_out),
+        extra={"n_fp16": int(len(fp16_idx)), "n_int2": int(len(int2_idx))},
+    )
 
-    keep_indices = torch.arange(L, device=k_list[0].device)
-    return k_out, v_out, keep_indices, total_bytes
+
+POLICIES = [
+    "fp16_reference",
+    "sink_recent_fp16",
+    "question_aware_fp16",
+    "token_wise_int4",
+    "channel_k_token_v_int4",
+    "hybrid_fp16_int2",
+]
+
+
+def apply_policy(name: str, k_list, v_list, importance: Optional[torch.Tensor]) -> PolicyResult:
+    L = k_list[0].shape[2]
+    if name == "fp16_reference":
+        return PolicyResult(
+            k=k_list, v=v_list, keep_indices=torch.arange(L, device=k_list[0].device), fp16_selected=None,
+            packed_bytes=L * bytes_per_fp16_token(), budget_bytes=compute_matched_int4_bytes(L, b=4),
+        )
+    if name == "sink_recent_fp16":
+        return apply_policy_sink_recent(k_list, v_list)
+    if name == "question_aware_fp16":
+        return apply_policy_question_aware(k_list, v_list, importance)
+    if name == "token_wise_int4":
+        return apply_policy_token_wise_int4(k_list, v_list)
+    if name == "channel_k_token_v_int4":
+        return apply_policy_channel_k_token_v_int4(k_list, v_list)
+    if name == "hybrid_fp16_int2":
+        return apply_policy_hybrid(k_list, v_list, importance)
+    raise ValueError(f"Unknown policy: {name}")

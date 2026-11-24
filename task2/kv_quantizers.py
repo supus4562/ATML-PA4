@@ -70,7 +70,9 @@ def quantize_affine_group(
         w_min = torch.amin(reshaped, dim=-1, keepdim=True)
         w_max = torch.amax(reshaped, dim=-1, keepdim=True)
         scale = ((w_max - w_min) / float(q_max)).clamp_min(1e-8)
-        zero = torch.round(-w_min / scale).clamp(0, q_max)
+        # Unclamped integer zero-point (stored as FP16). Clamping z to [0, q_max] breaks
+        # single-signed groups (e.g. biased key channels grouped along tokens).
+        zero = torch.round(-w_min / scale)
         q_int = torch.clamp(torch.round(reshaped / scale) + zero, 0, q_max)
         dequant_full = ((q_int - zero) * scale).view_as(t_full).to(orig_dtype)
         meta_bytes_per_group = 4  # FP16 scale + FP16 zero
