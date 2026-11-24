@@ -109,6 +109,8 @@ def _run_task2_in_container(
     run_all: bool = False,
     context_only: bool = False,
     debug: bool = False,
+    force_rerun: bool = False,
+    dgla_only: bool = False,
 ) -> dict:
     """Execute Task 2 inside cloud container with GPU acceleration and volume checkpointing."""
     import sys
@@ -141,9 +143,9 @@ def _run_task2_in_container(
 
     if smoke_test:
         print("\n>>> Launching Task 2 Smoke Test on Modal GPU <<<\n")
-        run_part_a(state_mgr, device="cuda", smoke_test=True)
-        run_part_b(state_mgr, device="cuda", smoke_test=True)
-        run_part_c(state_mgr, device="cuda", smoke_test=True)
+        run_part_a(state_mgr, device="cuda", smoke_test=True, force_rerun=force_rerun)
+        run_part_b(state_mgr, device="cuda", smoke_test=True, force_rerun=force_rerun)
+        run_part_c(state_mgr, device="cuda", smoke_test=True, force_rerun=force_rerun)
         print("\n✓ Smoke test finished successfully on cloud GPU.")
         state_mgr.commit_volume()
         return {"smoke_test": True, "elapsed_sec": time.perf_counter() - t0}
@@ -173,10 +175,11 @@ def _run_task2_in_container(
         run_all = True
 
     if part_a or run_all:
-        run_part_a(state_mgr, device="cuda")
+        run_part_a(state_mgr, device="cuda", force_rerun=force_rerun)
 
     if part_b or run_all:
-        run_part_b(state_mgr, device="cuda")
+        only_models = ["dgla"] if dgla_only else None
+        run_part_b(state_mgr, device="cuda", force_rerun=force_rerun, only_models=only_models)
 
     if part_c or run_all:
         run_part_c(state_mgr, device="cuda", force_rerun=True)
@@ -194,8 +197,8 @@ if app is not None:
         volumes=VOLUME_MOUNTS,
         timeout=3600 * 2,  # 2 hours max
     )
-    def run_task2_l4(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False):
-        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug)
+    def run_task2_l4(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False, force_rerun: bool = False, dgla_only: bool = False):
+        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug, force_rerun, dgla_only)
 
     @app.function(
         image=image,
@@ -203,8 +206,8 @@ if app is not None:
         volumes=VOLUME_MOUNTS,
         timeout=3600 * 2,
     )
-    def run_task2_a10g(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False):
-        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug)
+    def run_task2_a10g(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False, force_rerun: bool = False, dgla_only: bool = False):
+        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug, force_rerun, dgla_only)
 
     @app.function(
         image=image,
@@ -212,8 +215,8 @@ if app is not None:
         volumes=VOLUME_MOUNTS,
         timeout=3600 * 2,
     )
-    def run_task2_a100(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False):
-        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug)
+    def run_task2_a100(smoke_test: bool = False, part_a: bool = False, part_b: bool = False, part_c: bool = False, run_all: bool = False, context_only: bool = False, debug: bool = False, force_rerun: bool = False, dgla_only: bool = False):
+        return _run_task2_in_container(smoke_test, part_a, part_b, part_c, run_all, context_only, debug, force_rerun, dgla_only)
 
     @app.function(
         image=image,
@@ -254,6 +257,8 @@ def main(
     dry_run: bool = False,
     debug: bool = False,
     action: str = "",
+    force_rerun: bool = False,
+    dgla_only: bool = False,
 ):
     print("=" * 80)
     print("Modal Task 2 Orchestrator (100% Cloud Serverless Execution)")
@@ -261,6 +266,8 @@ def main(
     print(f"Volume:        atml-pa4-volume -> /root/volume")
     print(f"HF Cache:      atml-pa4-hf-cache -> /root/.cache/huggingface")
     print(f"Smoke Test:    {smoke_test}")
+    print(f"Force Rerun:   {force_rerun}")
+    print(f"DGLA Only:     {dgla_only}")
     print(f"Part A:        {part_a or run_all}")
     print(f"Part B:        {part_b or run_all}")
     print(f"Part C:        {part_c or run_all}")
@@ -310,6 +317,8 @@ def main(
         run_all=run_all,
         context_only=context_only,
         debug=debug,
+        force_rerun=force_rerun,
+        dgla_only=dgla_only,
     )
     print("\n[Modal Cloud] Execution finished successfully.")
 

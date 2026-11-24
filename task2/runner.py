@@ -34,9 +34,14 @@ from task2.mqar_dataset import load_frozen_mqar_test, load_mqar_development
 from task2.kv_eval import run_full_kv_evaluation
 
 
-def run_part_a(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: bool = False) -> Dict[str, Any]:
+def run_part_a(
+    state_mgr: Task2StateManager,
+    device: str = "cuda",
+    smoke_test: bool = False,
+    force_rerun: bool = False,
+) -> Dict[str, Any]:
     """Execute Part A: Attention Operators, Causality Verification, and Tiling Ablations."""
-    if state_mgr.is_completed("part_a_full") and not smoke_test:
+    if state_mgr.is_completed("part_a_full") and not smoke_test and not force_rerun:
         print("\n[Resume] Part A already completed. Skipping.")
         return state_mgr.get_part_a()
 
@@ -67,7 +72,13 @@ def run_part_a(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
     return part_a_results
 
 
-def run_part_b(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: bool = False) -> Dict[str, Any]:
+def run_part_b(
+    state_mgr: Task2StateManager,
+    device: str = "cuda",
+    smoke_test: bool = False,
+    force_rerun: bool = False,
+    only_models: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Execute Part B: Multi-Query Associative Recall (MQAR) training & evaluation."""
     print("\n" + "=" * 80)
     print("STEP 2: RUNNING PART B (MULTI-QUERY ASSOCIATIVE RECALL BENCHMARK)")
@@ -107,11 +118,13 @@ def run_part_b(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
     part_b_results = {}
 
     for attn_type, k, regime in training_grid:
+        if only_models is not None and attn_type not in only_models:
+            continue
         for seed in seeds:
             run_key = f"{attn_type}_k{k}_{regime}_seed{seed}"
             step_id = f"part_b_{run_key}"
 
-            if state_mgr.is_completed(step_id) and not smoke_test:
+            if state_mgr.is_completed(step_id) and not smoke_test and not force_rerun:
                 print(f"[Resume] Model '{run_key}' already completed. Skipping.")
                 continue
 
@@ -248,6 +261,7 @@ def main():
     parser.add_argument("--part-b", action="store_true", help="Run Part B MQAR training and evaluation")
     parser.add_argument("--part-c", action="store_true", help="Run Part C KV memory compression evaluation")
     parser.add_argument("--run-all", action="store_true", help="Run Part A, B, and C sequentially")
+    parser.add_argument("--force-rerun", action="store_true", help="Force rerun even if marked completed in state")
     parser.add_argument("--smoke-test", action="store_true", help="Run quick micro-verification test")
     parser.add_argument("--checkpoint-dir", type=str, default=str(CLOUD_CHECKPOINT_DIR))
     args = parser.parse_args()
@@ -269,20 +283,20 @@ def main():
 
     if args.smoke_test:
         print("\n[Mode] Running Fast Smoke Test...")
-        run_part_a(state_mgr, device=device, smoke_test=True)
-        run_part_b(state_mgr, device=device, smoke_test=True)
-        run_part_c(state_mgr, device=device, smoke_test=True)
+        run_part_a(state_mgr, device=device, smoke_test=True, force_rerun=args.force_rerun)
+        run_part_b(state_mgr, device=device, smoke_test=True, force_rerun=args.force_rerun)
+        run_part_c(state_mgr, device=device, smoke_test=True, force_rerun=args.force_rerun)
         print(f"\n✓ Smoke Test completed successfully in {time.perf_counter() - t0:.1f}s.")
         return
 
     if args.part_a or args.run_all:
-        run_part_a(state_mgr, device=device)
+        run_part_a(state_mgr, device=device, force_rerun=args.force_rerun)
 
     if args.part_b or args.run_all:
-        run_part_b(state_mgr, device=device)
+        run_part_b(state_mgr, device=device, force_rerun=args.force_rerun)
 
     if args.part_c or args.run_all:
-        run_part_c(state_mgr, device=device)
+        run_part_c(state_mgr, device=device, force_rerun=args.force_rerun)
 
     total_time = time.perf_counter() - t0
     print(f"\n{'='*80}")

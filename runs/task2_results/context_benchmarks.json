@@ -10,18 +10,18 @@
       "mean_accuracy": 1.0
     },
     "token_wise_int4": {
-      "mean_accuracy": 0.16666666666666666
-    },
-    "channel_k_token_v_int4": {
       "mean_accuracy": 0.0
     },
+    "channel_k_token_v_int4": {
+      "mean_accuracy": 1.0
+    },
     "hybrid_fp16_int2": {
-      "mean_accuracy": 0.16666666666666666
+      "mean_accuracy": 1.0
     }
   },
   "multi_needle_mniah": {
     "fp16_reference": {
-      "mean_needle_recall": 0.5208333333333334
+      "mean_needle_recall": 0.625
     },
     "sink_recent_fp16": {
       "mean_needle_recall": 0.125
@@ -30,18 +30,18 @@
       "mean_needle_recall": 0.625
     },
     "token_wise_int4": {
-      "mean_needle_recall": 0.1875
+      "mean_needle_recall": 0.0
     },
     "channel_k_token_v_int4": {
-      "mean_needle_recall": 0.020833333333333332
+      "mean_needle_recall": 0.5833333333333334
     },
     "hybrid_fp16_int2": {
-      "mean_needle_recall": 0.10416666666666667
+      "mean_needle_recall": 0.625
     }
   },
   "variable_tracking": {
     "fp16_reference": {
-      "mean_accuracy": 0.25
+      "mean_accuracy": 0.0
     },
     "sink_recent_fp16": {
       "mean_accuracy": 0.0
