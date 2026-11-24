@@ -18,6 +18,7 @@ def compute_model_packed_storage(
     sparsity_allocations: Optional[Dict[str, float]] = None,
     uniform_sparsity: Optional[float] = None,
     group_size: int = 128,
+    awq_channel_scales: bool = False,
 ) -> Dict[str, Any]:
     """Compute exact serialized/packed storage in bytes, nonzeros, and average bits per parameter.
 
@@ -26,7 +27,11 @@ def compute_model_packed_storage(
     - Quantization metadata per group (FP16 scale [2 bytes] + FP16 zero-point [2 bytes] = 4 bytes)
     - Uncompressed parameters (embeddings, norms, head) at 16 bits (2 bytes)
     - Tied parameters counted exactly once
-    - Sparse format (1 mask bit per eligible weight + 16 bits per nonzero + byte alignment)
+    - Sparse format (1 mask bit per eligible weight + 16 bits per nonzero + byte alignment).
+      Nonzeros are COUNTED from the current (pruned) weights, not taken from the nominal target.
+    - AWQ: inverse channel scales are not folded into an adjacent layer, so when
+      `awq_channel_scales=True` one FP16 scale per input channel per eligible projection
+      (in_features * 2 bytes) is serialized and counted as metadata.
     """
     eligible_modules = get_eligible_linear_modules(model, eligible_projections)
     eligible_param_count = sum(m.weight.numel() for m in eligible_modules.values())
@@ -59,8 +64,7 @@ def compute_model_packed_storage(
     if sparsity_allocations is not None or uniform_sparsity is not None:
         for name, module in eligible_modules.items():
             numel = module.weight.numel()
-            s = sparsity_allocations.get(name, uniform_sparsity) if sparsity_allocations else uniform_sparsity
-            nonzeros = int(round((1.0 - s) * numel))
+            nonzeros = int(torch.count_nonzero(module.weight.data).item())
             total_nonzeros += nonzeros
 
             # 1 mask bit per weight + 16 bits (2 bytes) per nonzero + byte alignment
@@ -97,6 +101,8 @@ def compute_model_packed_storage(
         payload_b = math.ceil((numel * b) / 8)
         # Metadata bytes: 2 bytes scale + 2 bytes zero = 4 bytes per group
         metadata_b = num_groups * 4
+        if awq_channel_scales:
+            metadata_b += module.weight.shape[1] * 2
 
         eligible_payload_bytes += payload_b
         eligible_metadata_bytes += metadata_b
@@ -117,4 +123,5 @@ def compute_model_packed_storage(
         "total_nonzeros": total_nonzeros,
         "effective_sparsity": 0.0,
         "avg_bits_per_param": avg_bits_per_param,
+        "awq_channel_scale_bytes_included": awq_channel_scales,
     }

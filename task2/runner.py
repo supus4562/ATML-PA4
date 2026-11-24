@@ -25,11 +25,12 @@ from task2.operators_bench import (
     run_extra_operator_ablations,
 )
 from task2.mqar_train import train_mqar_model
+from task2.config import INTERVENTION_SPEC
 from task2.mqar_eval import (
     evaluate_mqar_model,
     run_sequence_length_sweep,
 )
-from task2.mqar_dataset import load_frozen_mqar_test
+from task2.mqar_dataset import load_frozen_mqar_test, load_mqar_development
 from task2.kv_eval import run_full_kv_evaluation
 
 
@@ -73,6 +74,7 @@ def run_part_b(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
     print("=" * 80)
 
     test_examples = load_frozen_mqar_test()
+    dev_examples = load_mqar_development()
     updates = 50 if smoke_test else 4500
     seeds = [6304] if smoke_test else TRAIN_SEEDS
 
@@ -123,6 +125,10 @@ def run_part_b(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
                 seed=seed,
                 device=device,
                 total_updates=updates,
+                checkpoint_eval=lambda m, k=k: {
+                    reg: evaluate_mqar_model(m, dev_examples, k=k, regime=reg, device=device)["overall_accuracy"]
+                    for reg in ("near", "far", "mixed")
+                },
             )
 
             # Evaluate on near, far, mixed test sets
@@ -158,7 +164,10 @@ def run_part_b(state_mgr: Task2StateManager, device: str = "cuda", smoke_test: b
             model_record = {
                 "train_summary": train_summary,
                 "eval_metrics": eval_metrics,
+                "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
             }
+            if attn_type == "dgla":
+                model_record["intervention_spec"] = INTERVENTION_SPEC
             part_b_results[run_key] = model_record
 
             if not smoke_test:
@@ -191,12 +200,12 @@ def run_part_c(
     print("STEP 3: RUNNING PART C (PRETRAINED KV MEMORY COMPRESSION)")
     print("=" * 80)
 
-    print(f"Loading '{KV_MODEL_NAME}' in Bfloat16 on {device}...")
+    print(f"Loading '{KV_MODEL_NAME}' in FP16 (SDPA) on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(KV_MODEL_NAME, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         KV_MODEL_NAME,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
+        torch_dtype=torch.float16,
+        attn_implementation="sdpa",
         device_map=device,
     )
     model.eval()
@@ -207,6 +216,12 @@ def run_part_c(
         tokenizer=tokenizer,
         device=device,
         max_cases=max_cases,
+    )
+
+    from task2.kv_bench import run_kv_pack_benchmark
+    kv_results["c5_pack_benchmark"] = run_kv_pack_benchmark(
+        model, device=device, lengths=(2048,) if smoke_test else (2048, 4096),
+        batches=(1,) if smoke_test else (1, 8),
     )
 
     if not smoke_test:

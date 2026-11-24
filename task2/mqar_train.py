@@ -46,6 +46,7 @@ def train_mqar_model(
     total_updates: int = MQAR_TOTAL_UPDATES,
     batch_size: int = MQAR_BATCH_SIZE,
     verbose: bool = True,
+    checkpoint_eval=None,
 ) -> Tuple[MQARTransformer, Dict[str, Any]]:
     """Train a single MQAR model from scratch using the exact PA4 protocol."""
     torch.manual_seed(seed)
@@ -68,6 +69,9 @@ def train_mqar_model(
     model.train()
     t0 = time.perf_counter()
     pool_idx = 0
+    nonfinite_step = None
+    ckpt_dev_acc: Dict[int, Any] = {}
+    loss_val = float("nan")
 
     for step in range(1, total_updates + 1):
         # Update learning rate
@@ -83,15 +87,29 @@ def train_mqar_model(
         optimizer.zero_grad()
         logits = model(batch_inputs)  # (B, T, 64)
         loss = criterion(logits.view(-1, 64), batch_targets.view(-1))
+        if not torch.isfinite(loss):
+            # Record the failure explicitly instead of silently training on NaN.
+            nonfinite_step = nonfinite_step or step
+            print(f"  [WARN] non-finite loss at step {step}; skipping update", flush=True)
+            loss_history.append((step, float("nan"), cur_lr))
+            continue
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), MQAR_GRAD_CLIP)
+        if not torch.isfinite(grad_norm):
+            nonfinite_step = nonfinite_step or step
+            print(f"  [WARN] non-finite gradient at step {step}; skipping update", flush=True)
+            optimizer.zero_grad()
+            continue
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), MQAR_GRAD_CLIP)
         optimizer.step()
 
         loss_val = loss.item()
         loss_history.append((step, loss_val, cur_lr))
 
+        if checkpoint_eval is not None and step in MQAR_CHECKPOINT_UPDATES:
+            # Accuracy on the supplied DEVELOPMENT stream (never the final test set).
+            ckpt_dev_acc[step] = checkpoint_eval(model)
+            model.train()
         if step in MQAR_CHECKPOINT_UPDATES or step % 500 == 0:
             ckpt_losses[step] = loss_val
             if verbose:
@@ -109,7 +127,11 @@ def train_mqar_model(
         "seed": seed,
         "train_time_sec": train_time,
         "final_loss": loss_val,
+        "first_nonfinite_step": nonfinite_step,
+        "skipped_nonfinite_updates": sum(1 for _, l, _ in loss_history if l != l),
         "checkpoint_losses": ckpt_losses,
+        "checkpoint_dev_accuracy": ckpt_dev_acc,
+        "checkpoint_selection_rule": "none: the final (4,500-update) checkpoint is always reported",
         "loss_curve": loss_history[::20],  # Subsampled for compact logging
     }
 

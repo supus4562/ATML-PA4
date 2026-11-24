@@ -37,32 +37,43 @@ def load_results():
     return res, ci
 
 
+def hs_delta(res, cond):
+    """Paired change in acc_norm (percentage points) vs the FP16 baseline on the SAME HellaSwag IDs.
+
+    Conditions evaluated on the 512-ID diagnostic subset are compared with the baseline's first
+    512 IDs, so full-2,000 and 512-ID conditions are never mixed on one absolute axis.
+    """
+    ex = res[cond]["_per_example_hs"]
+    base = res["baseline_fp16"]["_per_example_hs"][: len(ex)]
+    return 100.0 * (sum(x["norm"] for x in ex) - sum(x["norm"] for x in base)) / len(ex)
+
+
 def plot_sparsity_tradeoff(res):
     """Figure 1: Quality vs. Global Sparsity."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     base_ppl = res["baseline_fp16"]["wikitext_ppl"]
-    base_hs = res["baseline_fp16"]["hellaswag_acc_norm"] * 100
+    base_hs = 0.0
 
     # Pruning data
     sparsities = [0.0, 0.25, 0.50, 0.75]
 
     # P1 Magnitude
     p1_ppl = [base_ppl, res["P1_magnitude_s25"]["wikitext_ppl"], res["P1_magnitude_s50"]["wikitext_ppl"], res["P1_magnitude_s75"]["wikitext_ppl"]]
-    p1_hs = [base_hs, res["P1_magnitude_s25"]["hellaswag_acc_norm"] * 100, res["P1_magnitude_s50"]["hellaswag_acc_norm"] * 100, res["P1_magnitude_s75"]["hellaswag_acc_norm"] * 100]
+    p1_hs = [base_hs, hs_delta(res, "P1_magnitude_s25"), hs_delta(res, "P1_magnitude_s50"), hs_delta(res, "P1_magnitude_s75")]
 
     # P2 Wanda
     p2_ppl = [base_ppl, res["P2_wanda_s25"]["wikitext_ppl"], res["P2_wanda_s50"]["wikitext_ppl"], res["P2_wanda_s75"]["wikitext_ppl"]]
-    p2_hs = [base_hs, res["P2_wanda_s25"]["hellaswag_acc_norm"] * 100, res["P2_wanda_s50"]["hellaswag_acc_norm"] * 100, res["P2_wanda_s75"]["hellaswag_acc_norm"] * 100]
+    p2_hs = [base_hs, hs_delta(res, "P2_wanda_s25"), hs_delta(res, "P2_wanda_s50"), hs_delta(res, "P2_wanda_s75")]
 
     # P3 Non-Uniform
     p3_sparsities = [0.0, 0.50, 0.75]
     p3_ppl = [base_ppl, res["P3_nonuniform_s50"]["wikitext_ppl"], res["P3_nonuniform_s75"]["wikitext_ppl"]]
-    p3_hs = [base_hs, res["P3_nonuniform_s50"]["hellaswag_acc_norm"] * 100, res["P3_nonuniform_s75"]["hellaswag_acc_norm"] * 100]
+    p3_hs = [base_hs, hs_delta(res, "P3_nonuniform_s50"), hs_delta(res, "P3_nonuniform_s75")]
 
     # 2:4 Structured
     p_24_ppl = res["P_structured_2_4"]["wikitext_ppl"]
-    p_24_hs = res["P_structured_2_4"]["hellaswag_acc_norm"] * 100
+    p_24_hs = hs_delta(res, "P_structured_2_4")
 
     # Subplot 1: WikiText Perplexity (log scale)
     ax1.plot(sparsities, p1_ppl, marker="o", color="#d62728", label="P1: Magnitude", linestyle="-")
@@ -84,7 +95,7 @@ def plot_sparsity_tradeoff(res):
     ax2.scatter([0.50], [p_24_hs], marker="*", color="#9467bd", s=180, zorder=5, label="Structured 2:4 (50%)")
 
     ax2.set_xlabel("Global Sparsity")
-    ax2.set_ylabel("Zero-Shot HellaSwag acc_norm (%)")
+    ax2.set_ylabel("Δ HellaSwag acc_norm vs FP16 on same IDs (pp)")
     ax2.set_title("Downstream Accuracy vs. Sparsity (Higher is Better)")
     ax2.grid(True)
     ax2.legend(loc="lower left")
@@ -102,22 +113,22 @@ def plot_quantization_tradeoff(res):
 
     base_mb = res["baseline_fp16"]["packed_mb"]
     base_ppl = res["baseline_fp16"]["wikitext_ppl"]
-    base_hs = res["baseline_fp16"]["hellaswag_acc_norm"] * 100
+    base_hs = 0.0
 
     # Q1 Uniform
     q1_mb = [res["Q1_uniform_int8"]["packed_mb"], res["Q1_uniform_int4"]["packed_mb"], res["Q1_uniform_int3"]["packed_mb"]]
     q1_ppl = [res["Q1_uniform_int8"]["wikitext_ppl"], res["Q1_uniform_int4"]["wikitext_ppl"], res["Q1_uniform_int3"]["wikitext_ppl"]]
-    q1_hs = [res["Q1_uniform_int8"]["hellaswag_acc_norm"] * 100, res["Q1_uniform_int4"]["hellaswag_acc_norm"] * 100, res["Q1_uniform_int3"]["hellaswag_acc_norm"] * 100]
+    q1_hs = [hs_delta(res, "Q1_uniform_int8"), hs_delta(res, "Q1_uniform_int4"), hs_delta(res, "Q1_uniform_int3")]
 
     # Q2 AWQ
     q2_mb = [res["Q2_awq_int8"]["packed_mb"], res["Q2_awq_int4"]["packed_mb"], res["Q2_awq_int3"]["packed_mb"]]
     q2_ppl = [res["Q2_awq_int8"]["wikitext_ppl"], res["Q2_awq_int4"]["wikitext_ppl"], res["Q2_awq_int3"]["wikitext_ppl"]]
-    q2_hs = [res["Q2_awq_int8"]["hellaswag_acc_norm"] * 100, res["Q2_awq_int4"]["hellaswag_acc_norm"] * 100, res["Q2_awq_int3"]["hellaswag_acc_norm"] * 100]
+    q2_hs = [hs_delta(res, "Q2_awq_int8"), hs_delta(res, "Q2_awq_int4"), hs_delta(res, "Q2_awq_int3")]
 
     # Q3 Mixed Precision
     q3_mb = [res["Q3_mixed_match_int4"]["packed_mb"], res["Q3_mixed_match_int3"]["packed_mb"]]
     q3_ppl = [res["Q3_mixed_match_int4"]["wikitext_ppl"], res["Q3_mixed_match_int3"]["wikitext_ppl"]]
-    q3_hs = [res["Q3_mixed_match_int4"]["hellaswag_acc_norm"] * 100, res["Q3_mixed_match_int3"]["hellaswag_acc_norm"] * 100]
+    q3_hs = [hs_delta(res, "Q3_mixed_match_int4"), hs_delta(res, "Q3_mixed_match_int3")]
 
     # Subplot 1: WikiText Perplexity
     ax1.plot([base_mb] + q1_mb, [base_ppl] + q1_ppl, marker="o", color="#e377c2", label="Q1: Uniform PTQ", linestyle="-")
@@ -136,7 +147,7 @@ def plot_quantization_tradeoff(res):
     ax2.scatter(q3_mb, q3_hs, marker="D", color="#ff7f0e", s=100, zorder=5, label="Q3: Mixed Precision")
 
     ax2.set_xlabel("Packed Storage (MB)")
-    ax2.set_ylabel("Zero-Shot HellaSwag acc_norm (%)")
+    ax2.set_ylabel("Δ HellaSwag acc_norm vs FP16 on same IDs (pp)")
     ax2.set_title("Downstream Accuracy vs. Model Storage (Higher is Better)")
     ax2.grid(True)
     ax2.legend(loc="lower right")
@@ -195,6 +206,95 @@ def plot_bootstrap_ci(ci):
     print("✓ Saved task1_bootstrap_ci.pdf & .png")
 
 
+PROJS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+
+def _layer_proj_matrix(values: dict) -> np.ndarray:
+    """{'model.layers.{i}.{mlp|self_attn}.{proj}': v} -> (n_layers, 7) matrix."""
+    n_layers = 1 + max(int(k.split(".")[2]) for k in values)
+    mat = np.full((n_layers, len(PROJS)), np.nan)
+    for k, v in values.items():
+        mat[int(k.split(".")[2]), PROJS.index(k.split(".")[-1])] = v
+    return mat
+
+
+def _heat(ax, mat, title, cbar_label, log=False, cmap="viridis"):
+    from matplotlib.colors import LogNorm
+    im = ax.imshow(mat.T, aspect="auto", cmap=cmap,
+                   norm=LogNorm(vmin=np.nanmin(mat[mat > 0]), vmax=np.nanmax(mat)) if log else None)
+    ax.set_yticks(range(len(PROJS)))
+    ax.set_yticklabels(PROJS)
+    ax.set_xlabel("Transformer block")
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax, label=cbar_label)
+
+
+def plot_sensitivity_and_allocations(res):
+    """Required evidence: sensitivity visualization per adaptive method + final sparsity/bit maps."""
+    p_sens_path = RESULTS_DIR / "pruning_sensitivity_full.json"
+    q_sens_path = RESULTS_DIR / "quant_sensitivity_full.json"
+    if not (p_sens_path.exists() and q_sens_path.exists()):
+        print("! sensitivity files missing; skipping sensitivity/allocation figure")
+        return
+    p_sens = json.loads(p_sens_path.read_text())
+    q_sens = json.loads(q_sens_path.read_text())
+    p_sel = json.loads((RESULTS_DIR / "p3_dev_selection.json").read_text()) if (RESULTS_DIR / "p3_dev_selection.json").exists() else {}
+    q_sel = json.loads((RESULTS_DIR / "q3_dev_selection.json").read_text()) if (RESULTS_DIR / "q3_dev_selection.json").exists() else {}
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 11))
+    _heat(axes[0, 0], _layer_proj_matrix(p_sens["relative"]), "P3 sensitivity: relative output error (Wanda 50%)", "rel. error", log=True)
+    _heat(axes[0, 1], _layer_proj_matrix(p_sens["absolute"]), "P3 sensitivity: absolute output error (Wanda 50%)", "MSE per token", log=True)
+    for j, s in enumerate((50, 75)):
+        cond = f"P3_nonuniform_s{s}"
+        if cond in res and "allocation_map" in res[cond]:
+            sel = p_sel.get(f"s{s}", {}).get("selected", {})
+            _heat(axes[1, j], _layer_proj_matrix(res[cond]["allocation_map"]),
+                  f"P3 sparsity map, global {s}% (measure={sel.get('measure')}, alpha={sel.get('alpha')})",
+                  "assigned sparsity", cmap="magma")
+    q4 = {k: v["4"] for k, v in q_sens["absolute"].items()}
+    _heat(axes[2, 0], _layer_proj_matrix(q4), "Q3 sensitivity: AWQ INT4 absolute output error", "error per token", log=True)
+    for cond, ax in (("Q3_mixed_match_int3", axes[2, 1]),):
+        if cond in res and "bit_allocation_map" in res[cond]:
+            sel = q_sel.get(cond, {}).get("selected", {})
+            _heat(ax, _layer_proj_matrix(res[cond]["bit_allocation_map"]),
+                  f"Q3 bit map at INT3 budget (measure={sel.get('measure')})", "bits", cmap="cividis")
+    plt.tight_layout()
+    fig.savefig(FIGURES_DIR / "task1_sensitivity_allocations.pdf", bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / "task1_sensitivity_allocations.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+    if "Q3_mixed_match_int4" in res and "bit_allocation_map" in res["Q3_mixed_match_int4"]:
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        _heat(ax, _layer_proj_matrix(res["Q3_mixed_match_int4"]["bit_allocation_map"]),
+              "Q3 bit map at INT4 budget", "bits", cmap="cividis")
+        plt.tight_layout()
+        fig.savefig(FIGURES_DIR / "task1_q3_int4_bitmap.png", dpi=200, bbox_inches="tight")
+        plt.close()
+    print("✓ Saved task1_sensitivity_allocations + task1_q3_int4_bitmap")
+
+
+def plot_calibration_vs_heldout(res):
+    """Diagnostic: calibration layer-output error vs held-out WikiText NLL change."""
+    pts = [(c, m["calibration_layer_output_error"]["mean_relative_layer_output_error"], m["wikitext_nll"] - res["baseline_fp16"]["wikitext_nll"])
+           for c, m in res.items() if isinstance(m, dict) and "calibration_layer_output_error" in m]
+    if not pts:
+        return
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for c, x, y in pts:
+        ax.scatter(x, y, s=50)
+        ax.annotate(c.replace("_", " "), (x, y), fontsize=7, xytext=(3, 3), textcoords="offset points")
+    ax.set_xscale("log")
+    ax.set_yscale("symlog", linthresh=0.01)
+    ax.set_xlabel("Mean relative layer-output error on calibration inputs")
+    ax.set_ylabel("Δ WikiText-2 mean NLL vs FP16 (nats)")
+    ax.set_title("Calibration criterion vs held-out quality")
+    ax.grid(True)
+    plt.tight_layout()
+    fig.savefig(FIGURES_DIR / "task1_calibration_vs_heldout.png", dpi=200, bbox_inches="tight")
+    plt.close()
+    print("✓ Saved task1_calibration_vs_heldout.png")
+
+
 def main():
     print("=" * 80)
     print("Generating Task 1 Report Figures...")
@@ -203,6 +303,8 @@ def main():
     plot_sparsity_tradeoff(res)
     plot_quantization_tradeoff(res)
     plot_bootstrap_ci(ci)
+    plot_sensitivity_and_allocations(res)
+    plot_calibration_vs_heldout(res)
     print("\n✓ All Task 1 figures successfully generated into figures/.")
 
 

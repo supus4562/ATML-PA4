@@ -28,6 +28,8 @@ from task2.config import (
     LOCAL_RESULTS_DIR,
     KV_MODEL_NAME,
 )
+from task2.kv_core import build_cache, greedy_decode, policy_tail_state, prefill_question, question_importance
+from task2.kv_policies import apply_policy
 from task2.kv_policies import (
     apply_policy_sink_recent,
     apply_policy_question_aware,
@@ -253,90 +255,23 @@ def evaluate_context_prompt(
     L_ctx = enc_context.input_ids.shape[1]
     L_q = enc_question.input_ids.shape[1]
 
-    # Prefill context
+    # Prefill context (FP16 SDPA model), then apply the shared Part C policy code.
     with torch.no_grad():
         out_ctx = model(**enc_context, use_cache=True)
-        pkv = out_ctx.past_key_values
+    n_layers = len(model.model.layers)
+    k_list = [out_ctx.past_key_values.layers[i].keys.clone() for i in range(n_layers)]
+    v_list = [out_ctx.past_key_values.layers[i].values.clone() for i in range(n_layers)]
+    del out_ctx
 
-    k_list = [pkv[i][0].clone() for i in range(len(pkv))]
-    v_list = [pkv[i][1].clone() for i in range(len(pkv))]
-
-    # Extract true SnapKV layer attention for question-aware policies
     q_importance = None
     if policy_name in ["question_aware_fp16", "hybrid_fp16_int2"]:
-        temp_cache = DynamicCache()
-        for layer_idx in range(len(k_list)):
-            temp_cache.update(k_list[layer_idx].clone(), v_list[layer_idx].clone(), layer_idx)
+        q_importance, _ = question_importance(model, k_list, v_list, enc_question.input_ids, L_ctx)
 
-        q_pos = torch.arange(L_ctx, L_ctx + L_q, device=device).unsqueeze(0)
-        with torch.no_grad():
-            out_probe = model(
-                input_ids=enc_question.input_ids,
-                position_ids=q_pos,
-                past_key_values=temp_cache,
-                output_attentions=True,
-                use_cache=False,
-            )
-            if out_probe.attentions is not None:
-                num_layers = len(out_probe.attentions)
-                attn_acc = torch.zeros(L_ctx, device=device, dtype=torch.float32)
-                for l_idx in range(num_layers // 2, num_layers):
-                    ctx_attn = out_probe.attentions[l_idx][0, :, :, :L_ctx]
-                    attn_acc += ctx_attn.mean(dim=(0, 1)).float()
-                q_importance = attn_acc
-            else:
-                q_importance = torch.ones(L_ctx, device=device)
-
-    # Apply policy
-    if policy_name == "fp16_reference":
-        k_comp, v_comp, keep_indices = k_list, v_list, torch.arange(L_ctx, device=device)
-    elif policy_name == "sink_recent_fp16":
-        k_comp, v_comp, keep_indices, _ = apply_policy_sink_recent(k_list, v_list)
-    elif policy_name == "question_aware_fp16":
-        k_comp, v_comp, keep_indices, _ = apply_policy_question_aware(k_list, v_list, q_importance)
-    elif policy_name == "token_wise_int4":
-        k_comp, v_comp, keep_indices, _ = apply_policy_token_wise_int4(k_list, v_list)
-    elif policy_name == "channel_k_token_v_int4":
-        k_comp, v_comp, keep_indices, _ = apply_policy_channel_k_token_v_int4(k_list, v_list)
-    elif policy_name == "hybrid_fp16_int2":
-        k_comp, v_comp, keep_indices, _ = apply_policy_hybrid(k_list, v_list, q_importance)
-    else:
-        raise ValueError(f"Unknown policy: {policy_name}")
-
-    cache = DynamicCache()
-    for layer_idx in range(len(k_comp)):
-        cache.update(k_comp[layer_idx], v_comp[layer_idx], layer_idx)
-
-    question_pos_ids = torch.arange(L_ctx, L_ctx + L_q, device=device).unsqueeze(0)
-    with torch.no_grad():
-        out_q = model(
-            input_ids=enc_question.input_ids,
-            position_ids=question_pos_ids,
-            past_key_values=cache,
-            use_cache=True,
-        )
-
-    # Decode up to 48 tokens
-    curr_input = torch.argmax(out_q.logits[:, -1, :], dim=-1, keepdim=True)
-    generated_tokens = [curr_input.item()]
-    curr_cache = out_q.past_key_values
-    curr_pos = L_ctx + L_q
-
-    with torch.no_grad():
-        for _ in range(47):
-            out_gen = model(
-                input_ids=curr_input,
-                position_ids=torch.tensor([[curr_pos]], device=device),
-                past_key_values=curr_cache,
-                use_cache=True,
-            )
-            curr_input = torch.argmax(out_gen.logits[:, -1, :], dim=-1, keepdim=True)
-            tok_id = curr_input.item()
-            generated_tokens.append(tok_id)
-            if tok_id in [tokenizer.eos_token_id, 151643, 151645]:
-                break
-            curr_cache = out_gen.past_key_values
-            curr_pos += 1
+    res = apply_policy(policy_name, k_list, v_list, q_importance)
+    state = policy_tail_state(res)
+    cache = build_cache(res.k, res.v)
+    first = prefill_question(model, cache, enc_question.input_ids, L_ctx, state)
+    generated_tokens, _ = greedy_decode(model, cache, first, L_ctx + L_q, state, max_new_tokens=48)
 
     gen_text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 

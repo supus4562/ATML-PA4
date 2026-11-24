@@ -177,6 +177,36 @@ def get_sdpa_backend(device: str = "cuda") -> str:
     return ", ".join(backends) if backends else "Unknown"
 
 
+def probe_sdpa_backend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> dict:
+    """Determine which SDPA backends accept these exact tensors and which one default
+    dispatch selects. Each backend is forced alone via torch.nn.attention.sdpa_kernel; the
+    default dispatcher picks the first supported backend in PyTorch's priority order
+    (cuDNN, Flash, Efficient, Math in PyTorch >= 2.5; Flash, Efficient, Math earlier).
+    """
+    if not q.is_cuda:
+        return {"supported": ["MATH"], "dispatched": "MATH"}
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    order = []
+    for name in ("CUDNN_ATTENTION", "FLASH_ATTENTION", "EFFICIENT_ATTENTION", "MATH"):
+        if hasattr(SDPBackend, name):
+            order.append((name, getattr(SDPBackend, name)))
+    supported = []
+    with torch.no_grad():
+        for name, be in order:
+            try:
+                with sdpa_kernel([be]):
+                    F.scaled_dot_product_attention(q[:1, :1, :128], k[:1, :1, :128], v[:1, :1, :128], is_causal=True)
+                supported.append(name)
+            except RuntimeError:
+                pass
+    # Default dispatch priority (matches torch's sdp_utils ordering).
+    priority = [n for n, _ in order]
+    dispatched = next((n for n in priority if n in supported), "UNKNOWN")
+    if "CUDNN_ATTENTION" in supported and torch.__version__ < "2.5":
+        dispatched = next((n for n in priority[1:] if n in supported), dispatched)
+    return {"supported": supported, "dispatched": dispatched, "torch": torch.__version__}
+
+
 def sdpa_attention(
     q: torch.Tensor,
     k: torch.Tensor,

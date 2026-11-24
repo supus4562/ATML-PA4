@@ -112,6 +112,16 @@ def evaluate_perplexity(
     }
 
 
+def _hs_preprocess(text: str) -> str:
+    """lm-evaluation-harness HellaSwag preprocessing."""
+    import re
+    text = text.strip()
+    text = text.replace(" [title]", ". ")
+    text = re.sub("\\[.*?\\]", "", text)
+    text = text.replace("  ", " ")
+    return text
+
+
 def pretokenize_hellaswag(
     tokenizer: Any,
     hellaswag_path: Path | str,
@@ -136,8 +146,9 @@ def pretokenize_hellaswag(
     tokenized = []
     print(f"[Pretokenize HellaSwag] Tokenizing {len(raw_examples)} examples once...")
     for ex in raw_examples:
-        ctx = ex["ctx"]
-        endings = ex["endings"]
+        # lm-evaluation-harness `hellaswag` task formatting (doc_to_text / doc_to_choice).
+        ctx = _hs_preprocess(ex["activity_label"] + ": " + ex["ctx_a"] + " " + ex["ctx_b"].capitalize())
+        endings = [_hs_preprocess(e) for e in ex["endings"]]
         label = int(ex["label"])
 
         enc_ctx = tokenizer(ctx, add_special_tokens=False)["input_ids"]
@@ -251,12 +262,21 @@ def evaluate_hellaswag(
                 per_example_correct.append({
                     "raw": is_raw,
                     "norm": is_norm,
+                    "pred_raw": pred_raw,
+                    "pred_norm": pred_norm,
+                    "label": label,
+                    "cand_logprob": [round(x, 4) for x in cand_log_probs],
+                    "cand_logprob_per_char": [round(x, 6) for x in cand_norm_log_probs],
                 })
 
     raw_acc = correct_raw / max(1, total_evaluated)
     norm_acc = correct_norm / max(1, total_evaluated)
 
     return {
+        "task_format": "lm-evaluation-harness `hellaswag` formatting: context = preprocess(activity_label + ': ' + "
+                       "ctx_a + ' ' + ctx_b.capitalize()); continuation = ' ' + preprocess(ending); score = sum of "
+                       "continuation-token log-probs; acc_norm = argmax(score / len(preprocessed ending chars)); "
+                       "Rowan/hellaswag validation, 0-shot, no BOS",
         "total_samples": total_evaluated,
         "acc": raw_acc,
         "acc_norm": norm_acc,
@@ -331,26 +351,95 @@ def benchmark_model_latency_and_vram(
 
             prefill_latencies[f"prefill_{seq_len}"] = float(np.mean(times))
 
-    # 2. Decode latency (64 tokens)
+    # 2. Decode latency: 64 autoregressive steps that reuse the KV cache of a fixed
+    #    512-token prompt (prefill excluded from the timed region).
     with torch.inference_mode():
-        dummy_input = torch.randint(100, 1000, (1, 1), device=device)
-        for _ in range(2):
-            _ = model(dummy_input)
-        torch.cuda.synchronize(device)
+        prompt = torch.randint(100, 1000, (1, 512), device=device)
+        next_tok = torch.randint(100, 1000, (1, 1), device=device)
 
-        times = []
-        for _ in range(repetitions):
-            t0 = time.perf_counter()
-            for _ in range(decode_tokens):
-                _ = model(dummy_input)
+        def _decode_once() -> None:
+            out = model(prompt, use_cache=True)
+            pkv = out.past_key_values
             torch.cuda.synchronize(device)
-            times.append(time.perf_counter() - t0)
+            t_start = time.perf_counter()
+            for _ in range(decode_tokens):
+                out = model(next_tok, past_key_values=pkv, use_cache=True)
+                pkv = out.past_key_values
+            torch.cuda.synchronize(device)
+            return time.perf_counter() - t_start
 
+        for _ in range(2):
+            _decode_once()
+        times = [_decode_once() for _ in range(repetitions)]
         decode_latency = float(np.mean(times))
 
     peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
     results.update(prefill_latencies)
     results["decode_64_tokens"] = decode_latency
+    results["timing_repetitions"] = repetitions
+    results["timing_unit"] = "seconds (mean of warmed-up, CUDA-synchronized repetitions)"
     results["peak_vram_mb"] = peak_vram_mb
     return results
+
+
+def compute_paired_pooled_ppl_bootstrap(
+    windows_a: List[Dict[str, float]],
+    windows_b: List[Dict[str, float]],
+    num_resamples: int = 2000,
+    seed: int = 6304,
+) -> Dict[str, float]:
+    """Paired bootstrap over whole evaluation windows for perplexity differences (b - a).
+
+    Each resample draws window indices with replacement, recomputes the pooled token NLL
+    sum(nll_w * tokens_w) / sum(tokens_w) for both models on the same windows, and
+    exponentiates before differencing (PA4 Task 1 required evidence).
+    """
+    n = min(len(windows_a), len(windows_b))
+    tok = np.array([w["tokens"] for w in windows_a[:n]], dtype=np.float64)
+    tok_b = np.array([w["tokens"] for w in windows_b[:n]], dtype=np.float64)
+    assert np.array_equal(tok, tok_b), "Paired windows must score identical token counts"
+    nll_a = np.array([w["nll"] for w in windows_a[:n]], dtype=np.float64) * tok
+    nll_b = np.array([w["nll"] for w in windows_b[:n]], dtype=np.float64) * tok
+
+    def _ppl(idx, nll):
+        return float(np.exp(nll[idx].sum() / tok[idx].sum()))
+
+    rng = np.random.default_rng(seed)
+    all_idx = np.arange(n)
+    diffs_ppl, diffs_nll = [], []
+    for _ in range(num_resamples):
+        idx = rng.integers(0, n, size=n)
+        diffs_ppl.append(_ppl(idx, nll_b) - _ppl(idx, nll_a))
+        diffs_nll.append((nll_b[idx].sum() - nll_a[idx].sum()) / tok[idx].sum())
+    return {
+        "ppl_a": _ppl(all_idx, nll_a),
+        "ppl_b": _ppl(all_idx, nll_b),
+        "mean_diff_ppl": _ppl(all_idx, nll_b) - _ppl(all_idx, nll_a),
+        "ci_low_ppl": float(np.percentile(diffs_ppl, 2.5)),
+        "ci_high_ppl": float(np.percentile(diffs_ppl, 97.5)),
+        "mean_diff_pooled_nll": float((nll_b.sum() - nll_a.sum()) / tok.sum()),
+        "ci_low_pooled_nll": float(np.percentile(diffs_nll, 2.5)),
+        "ci_high_pooled_nll": float(np.percentile(diffs_nll, 97.5)),
+        "windows": n,
+        "scored_tokens": int(tok.sum()),
+        "resamples": num_resamples,
+    }
+
+
+def evaluate_token_nll(
+    model: nn.Module,
+    token_tensor: torch.Tensor,
+    device: str = "cuda",
+    batch_size: int = 8,
+) -> float:
+    """Mean next-token NLL over fixed-length sequences (used on the C4 development split)."""
+    total, count = 0.0, 0
+    with torch.inference_mode():
+        for i in range(0, token_tensor.shape[0], batch_size):
+            batch = token_tensor[i : i + batch_size].to(device)
+            logits = model(input_ids=batch).logits[:, :-1].float()
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), batch[:, 1:].reshape(-1), reduction="sum")
+            total += float(loss.item())
+            count += batch[:, 1:].numel()
+    return total / max(1, count)

@@ -221,6 +221,9 @@ def main(
             "checkpoints/task1/bootstrap_ci.json",
             "checkpoints/task1/pruning_sensitivity_full.json",
             "checkpoints/task1/quant_sensitivity_full.json",
+            "checkpoints/task1/p3_dev_selection.json",
+            "checkpoints/task1/q3_dev_selection.json",
+            "checkpoints/task1/calibration_time.json",
             "checkpoints/task1/pruning_sensitivity.json",
             "checkpoints/task1/quant_sensitivity.json",
         ]

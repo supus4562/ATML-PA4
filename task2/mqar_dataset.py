@@ -78,6 +78,13 @@ def load_frozen_mqar_test() -> List[Dict]:
     return records
 
 
+def load_mqar_development() -> List[Dict]:
+    """Load the supplied development stream (disjoint from training and final test)."""
+    dev_path = REPO_ROOT / "data" / "mqar" / "mqar_development.jsonl.gz"
+    with gzip.open(dev_path, "rt", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def pregenerate_gpu_training_pool(
     k: int,
     regime: str,

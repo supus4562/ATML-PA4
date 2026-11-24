@@ -46,6 +46,8 @@ def plot_attention_operators(data: dict):
         sub = [r for r in grid if r["operator"] == op and r["dtype"] == "fp16"]
         if sub:
             xs = [r["length"] for r in sub]
+            sub = [r for r in sub if isinstance(r["fwd_latency_ms"], (int, float))]
+            xs = [r["length"] for r in sub]
             ys = [r["fwd_latency_ms"] for r in sub]
             ax1.plot(xs, ys, marker=markers[op], color=colors[op], label=op.upper(), linewidth=1.8)
     ax1.set_xscale("log", base=2)
@@ -62,6 +64,8 @@ def plot_attention_operators(data: dict):
         sub = [r for r in grid if r["operator"] == op and r["dtype"] == "fp16"]
         if sub:
             xs = [r["length"] for r in sub]
+            sub = [r for r in sub if isinstance(r["output_err_vs_fp32"], (int, float))]
+            xs = [r["length"] for r in sub]
             ys = [max(1e-7, r["output_err_vs_fp32"]) for r in sub]
             ax2.plot(xs, ys, marker=markers[op], color=colors[op], label=f"{op.upper()} (FP16)", linewidth=1.8)
     ax2.set_xscale("log", base=2)
@@ -77,6 +81,8 @@ def plot_attention_operators(data: dict):
     for op in ops:
         sub = [r for r in grid if r["operator"] == op and r["dtype"] == "fp16"]
         if sub:
+            xs = [r["length"] for r in sub]
+            sub = [r for r in sub if isinstance(r["peak_vram_mb"], (int, float))]
             xs = [r["length"] for r in sub]
             ys = [r["peak_vram_mb"] for r in sub]
             ax3.plot(xs, ys, marker=markers[op], color=colors[op], label=op.upper(), linewidth=1.8)
@@ -191,7 +197,7 @@ def plot_kv_results(part_c_data: dict):
         ax1.scatter(mb, acc, color=colors[idx % len(colors)], s=120, label=p.replace("_", " ").title())
         ax1.annotate(p.split("_")[0].upper(), (mb, acc), textcoords="offset points", xytext=(5, 5), fontsize=8)
 
-    ax1.set_xlabel("Packed KV Cache (MB)")
+    ax1.set_xlabel("Serialized pre-question KV cache (MB, packed estimate)")
     ax1.set_ylabel("Exact Match Retrieval Accuracy (%)")
     ax1.set_title("Retrieval Quality vs. KV Cache Size")
     ax1.grid(True, linestyle="--", alpha=0.5)
@@ -199,8 +205,8 @@ def plot_kv_results(part_c_data: dict):
 
     # 2. Forest plot of Paired 95% Bootstrap CIs
     ax2 = axes[1]
-    ci_keys = [k for k in bootstrap.keys() if k.endswith("_acc")]
-    labels = [k.replace("_vs_question_aware_acc", "").replace("_", " ").title() for k in ci_keys]
+    ci_keys = [k for k in bootstrap.keys() if k.endswith("_minus_fp16_reference_accuracy")]
+    labels = [k.replace("_minus_fp16_reference_accuracy", "").replace("_", " ") for k in ci_keys]
     means = [bootstrap[k]["mean"] * 100.0 for k in ci_keys]
     lowers = [bootstrap[k]["ci_lower"] * 100.0 for k in ci_keys]
     uppers = [bootstrap[k]["ci_upper"] * 100.0 for k in ci_keys]
@@ -210,7 +216,7 @@ def plot_kv_results(part_c_data: dict):
     ax2.axvline(0.0, color="gray", linestyle="--", alpha=0.7)
     ax2.set_yticks(y_pos)
     ax2.set_yticklabels(labels)
-    ax2.set_xlabel("Accuracy Difference vs. Question-Aware SnapKV (%)")
+    ax2.set_xlabel("Exact-match accuracy minus FP16 reference (pp, paired, n=180)")
     ax2.set_title("Paired 95% Bootstrap CIs (B=2,000)")
     ax2.grid(True, linestyle="--", alpha=0.5)
 

@@ -193,7 +193,7 @@ class DGLAAttention(nn.Module):
     
     Applies learned input-dependent decay gamma_t = sigmoid(W_gamma x_t + b_gamma)
     to linear attention recurrence: S_t = gamma_t * S_{t-1} + phi(k_t) v_t^T.
-    Adds only 129 parameters (<< 5% limit).
+    Adds 516 parameters per layer (gate_proj), well under the 5% limit.
     """
 
     def __init__(self, d_model: int = MQAR_HIDDEN_DIM, n_heads: int = MQAR_NUM_HEADS, eps: float = 1e-6):
@@ -216,24 +216,22 @@ class DGLAAttention(nn.Module):
         q = self.feature_map(self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2))
         k = self.feature_map(self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2))
         v = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        # Decay gates: (B, H, T) in range (0.5, 1.0) via scaled sigmoid for long-term retention
-        gamma = (0.5 + 0.5 * torch.sigmoid(self.gate_proj(x))).transpose(1, 2).clamp(min=1e-4, max=1.0)
-
-        # Parallelized decay cumsum: decay[b, h, t, tau] = exp(cumsum[t] - cumsum[tau])
-        log_gamma = torch.log(gamma)  # (B, H, T)
+        # Decay gates gamma in (0.5, 1.0) per head and position (scaled sigmoid).
+        # Parallelized decay: decay[b, h, t, tau] = exp(cumsum[t] - cumsum[tau]) for tau <= t.
+        # Computed in FP32; the exponent is clamped to <= 0 BEFORE exp and masked with
+        # torch.where so no inf/NaN can be produced or back-propagated from the upper triangle.
+        log_gamma = F.logsigmoid(self.gate_proj(x).float()).transpose(1, 2)  # log(sigmoid) in (-inf, 0)
+        log_gamma = torch.log(0.5 + 0.5 * log_gamma.exp())  # gamma in (0.5, 1.0), log stays finite
         cumsum = torch.cumsum(log_gamma, dim=-1)  # (B, H, T)
         diff = cumsum.unsqueeze(-1) - cumsum.unsqueeze(-2)  # (B, H, T, T)
         causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).unsqueeze(0).unsqueeze(0)
-        diff = diff.masked_fill(~causal_mask, -1e4)
-        decay = torch.exp(diff)
-        decay = decay.masked_fill(~causal_mask, 0.0)
+        decay = torch.where(causal_mask, torch.exp(torch.clamp(diff, max=0.0)), torch.zeros_like(diff))
 
-        # Parallel linear attention with input-dependent decay
-        qk = torch.matmul(q, k.transpose(-2, -1)) * decay  # (B, H, T, T)
-        out = torch.matmul(qk, v)  # (B, H, T, d_h)
-        z = torch.matmul(decay, k)  # (B, H, T, d_h)
-        den = torch.sum(q * z, dim=-1, keepdim=True) + self.eps
-        out = out / den
+        q32, k32, v32 = q.float(), k.float(), v.float()
+        qk = torch.matmul(q32, k32.transpose(-2, -1)) * decay  # (B, H, T, T)
+        out = torch.matmul(qk, v32)  # (B, H, T, d_h)
+        den = qk.sum(dim=-1, keepdim=True).clamp_min(self.eps)  # = q_t . sum_tau decay * k_tau
+        out = (out / den).to(x.dtype)
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out)
